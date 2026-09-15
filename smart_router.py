@@ -24,6 +24,16 @@ if not MODELS:
 key_penalties = {}  # key -> timestamp when it was banned
 request_history = {} # (key, model) -> list of timestamps
 
+# Global Metrics
+metrics = {
+    "total_incoming_requests": 0,
+    "successful_api_calls": 0,
+    "rate_limit_hits": 0,
+    "fallback_calls": 0,
+    "failed_requests": 0,
+    "usage_by_key": {}
+}
+
 state_lock = threading.Lock()
 current_key_idx = 0
 current_model_idx = 0
@@ -75,6 +85,9 @@ def proxy_chat():
     if request.method == 'OPTIONS':
         return Response(status=200)
         
+    with state_lock:
+        metrics["total_incoming_requests"] += 1
+        
     data = request.json
     original_auth = request.headers.get("Authorization", "")
     
@@ -94,6 +107,15 @@ def proxy_chat():
         try:
             resp = requests.post(url, json=data, headers=headers, stream=True)
             if resp.status_code == 200:
+                with state_lock:
+                    metrics["successful_api_calls"] += 1
+                    safe_key = key[:5] + "..."
+                    if safe_key not in metrics["usage_by_key"]:
+                        metrics["usage_by_key"][safe_key] = {}
+                    if model_name not in metrics["usage_by_key"][safe_key]:
+                        metrics["usage_by_key"][safe_key][model_name] = 0
+                    metrics["usage_by_key"][safe_key][model_name] += 1
+                    
                 excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
                 out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
                                if name.lower() not in excluded_headers]
@@ -101,12 +123,15 @@ def proxy_chat():
             elif resp.status_code in [429, 403]:
                 with state_lock:
                     key_penalties[key] = time.time()
+                    metrics["rate_limit_hits"] += 1
                 print(f"Key {key[:5]}... hit 429/403. Penalized for 24h.")
                 continue
             elif resp.status_code in [500, 503]:
                 print(f"Model {model_name} overloaded (500/503). Trying next combo...")
                 continue
             else:
+                with state_lock:
+                    metrics["failed_requests"] += 1
                 return Response(resp.content, resp.status_code)
         except Exception as e:
             print(f"API call error: {e}")
@@ -114,6 +139,9 @@ def proxy_chat():
             
     # FALLBACK to Web2API
     print("Falling back to Web2API on port 8081...")
+    with state_lock:
+        metrics["fallback_calls"] += 1
+        
     fallback_url = "http://127.0.0.1:8081/v1/chat/completions"
     fallback_headers = {
         "Authorization": original_auth,
@@ -126,6 +154,8 @@ def proxy_chat():
                        if name.lower() not in excluded_headers]
         return Response(resp.content, resp.status_code, out_headers)
     except Exception as e:
+        with state_lock:
+            metrics["failed_requests"] += 1
         return jsonify({"error": {"message": "All APIs failed and Fallback is down.", "type": "server_error"}}), 500
 
 @app.route('/add', methods=['POST'])
@@ -146,6 +176,7 @@ def get_status():
     now = time.time()
     penalized = {k[:5]+"...": round((86400 - (now - ts))/3600, 1) for k, ts in key_penalties.items()}
     return jsonify({
+        "metrics": metrics,
         "active_keys": len(API_KEYS),
         "penalized_keys_hours_left": penalized,
         "models": MODELS
