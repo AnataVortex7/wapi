@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Nginx config
 COPY nginx.conf /etc/nginx/nginx.conf
 
-# Start script
+# Start script and Router
+COPY smart_router.py /app/smart_router.py
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
