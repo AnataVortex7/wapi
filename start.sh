@@ -1,4 +1,7 @@
 #!/bin/bash
+# Replace the password placeholder in nginx config with the environment variable
+sed -i "s/_DYNAMIC_PASSWORD_/${API_PASSWORD}/g" /etc/nginx/nginx.conf
+
 # Start panel (which starts gemini on 8081) in background
 python3 panel.py > panel.log 2>&1 &
 

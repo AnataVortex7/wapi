@@ -160,7 +160,8 @@ def proxy_chat():
 
 @app.route('/add', methods=['POST'])
 def add_key_model():
-    if request.headers.get("Authorization") != "Bearer Swapnpurti@1181":
+    expected_pass = os.environ.get("API_PASSWORD", "")
+    if request.headers.get("Authorization") != f"Bearer {expected_pass}":
         return jsonify({"error": "Unauthorized"}), 401
         
     data = request.json
