@@ -1,5 +1,6 @@
-import os, json, time, threading
-from flask import Flask, request, jsonify, Response
+import os, json, time, threading, datetime
+from collections import deque
+from flask import Flask, request, jsonify, Response, render_template_string
 import requests
 
 app = Flask(__name__)
@@ -79,6 +80,108 @@ def get_next_available_combo():
                 return key, model['name']
                 
         return None, None
+
+
+request_logs = deque(maxlen=500)
+
+@app.before_request
+def log_request_info():
+    # Don't log system endpoints to avoid spam
+    if request.path in ['/logs', '/debug_auth', '/status', '/v1/models']:
+        return
+        
+    auth_header = request.headers.get('Authorization', 'None')
+    expected_pass = os.environ.get("API_PASSWORD", "Swapnpurti@1181")
+    is_correct = (auth_header == f"Bearer {expected_pass}")
+    
+    # Extract the actual message asked by the user (if it's a chat request)
+    msg = ""
+    if request.is_json:
+        try:
+            body = request.get_json(silent=True) or {}
+            if "messages" in body and isinstance(body["messages"], list) and len(body["messages"]) > 0:
+                # get the last message (usually user's prompt)
+                msg = body["messages"][-1].get("content", "")
+        except:
+            pass
+
+    log_entry = {
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ip": request.headers.get("Cf-Connecting-Ip", request.headers.get("X-Forwarded-For", request.remote_addr)),
+        "path": request.path,
+        "password_used": auth_header,
+        "is_password_correct": is_correct,
+        "message_preview": msg[:200] + ("..." if len(msg) > 200 else "")
+    }
+    
+    request_logs.appendleft(log_entry)
+
+@app.route('/logs', methods=['GET'])
+def view_logs():
+    html_template = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>API Request Logs</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #f0f2f5; }
+            .container { max-width: 1200px; margin: 0 auto; }
+            h1 { color: #1a1a1a; text-align: center; margin-bottom: 30px; }
+            .table-wrapper { background: white; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); overflow-x: auto; }
+            table { width: 100%; border-collapse: collapse; min-width: 800px; }
+            th, td { padding: 15px; text-align: left; border-bottom: 1px solid #ddd; }
+            th { background-color: #2c3e50; color: white; font-weight: 600; }
+            tr:hover { background-color: #f8f9fa; }
+            .status-correct { color: #155724; background-color: #d4edda; padding: 5px 10px; border-radius: 4px; font-weight: bold; font-size: 0.9em; }
+            .status-wrong { color: #721c24; background-color: #f8d7da; padding: 5px 10px; border-radius: 4px; font-weight: bold; font-size: 0.9em; }
+            .msg { max-width: 350px; white-space: pre-wrap; word-break: break-word; font-size: 0.95em; color: #333; }
+            .pwd { font-family: monospace; background: #eee; padding: 3px 6px; border-radius: 3px; }
+            .empty-msg { text-align: center; padding: 40px; color: #666; font-size: 1.1em; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🛡️ API Request Logs</h1>
+            <div class="table-wrapper">
+                {% if logs %}
+                <table>
+                    <tr>
+                        <th>Time</th>
+                        <th>IP Address</th>
+                        <th>Path</th>
+                        <th>Password Used</th>
+                        <th>Status</th>
+                        <th>Message / Prompt</th>
+                    </tr>
+                    {% for log in logs %}
+                    <tr>
+                        <td style="white-space: nowrap; color: #555;">{{ log.time }}</td>
+                        <td style="font-family: monospace;">{{ log.ip }}</td>
+                        <td>{{ log.path }}</td>
+                        <td><span class="pwd">{{ log.password_used }}</span></td>
+                        <td>
+                            {% if log.is_password_correct %}
+                                <span class="status-correct">Correct</span>
+                            {% else %}
+                                <span class="status-wrong">Wrong</span>
+                            {% endif %}
+                        </td>
+                        <td class="msg">{{ log.message_preview or '<span style="color: #999; font-style: italic;">No message</span>'|safe }}</td>
+                    </tr>
+                    {% endfor %}
+                </table>
+                {% else %}
+                <div class="empty-msg">No requests logged yet. Try sending a request to the API!</div>
+                {% endif %}
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+    return render_template_string(html_template, logs=list(request_logs))
+
+
 
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 def proxy_chat():
