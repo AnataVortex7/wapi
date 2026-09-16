@@ -163,6 +163,7 @@ def view_secure_logs():
     <head>
         <title>Secure API Logs</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta http-equiv="refresh" content="5">
         <style>
             body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #121212; color: #e0e0e0; }
             .container { max-width: 1400px; margin: 0 auto; }
