@@ -1,3 +1,33 @@
+"""
+################################################################################
+# WAPI - ADVANCED INTELLIGENT ROUTER (Future-Proof)
+################################################################################
+# HOW TO USE:
+#
+# 1. SETTING THE MASTER PASSWORD
+#    Env Var: PASSWORD=YourSecretPass
+#    (All API requests and /router/logs require this password)
+#
+# 2. ADDING KEYS FOR ANY PROVIDER (Future-Proof)
+#    Just add comma-separated keys to the respective environment variables:
+#    - GEMINI_API_KEYS=key1,key2,key3
+#    - OPENAI_API_KEYS=sk-proj-...,sk-proj-...
+#    - CLAUDE_API_KEYS=sk-ant-...,sk-ant-...
+#    - HF_API_KEYS=hf_...,hf_...
+#
+# 3. SETTING THE "DEFAULT" ROUND-ROBIN POOL
+#    When the user requests model "auto" (or no model), the proxy will 
+#    round-robin across this exact pool.
+#    Env Var: MODELS_POOL=gemini-1.5-flash:15,gpt-4o-mini:50,claude-3-haiku-20240307:20
+#    (Format is model_name:requests_per_minute)
+#
+# 4. HOW IT WORKS:
+#    - If you request /model custom/gpt-4o -> It automatically uses OPENAI_API_KEYS and OpenAI's API.
+#    - If you request /model custom/claude-3-5-sonnet-20240620 -> It automatically uses CLAUDE_API_KEYS and translates to Anthropic's API.
+#    - If a key fails or rate-limits, it instantly tries the next key.
+#    - If all keys for a specific model fail, it falls back to your MODELS_POOL.
+################################################################################
+"""
 import os, json, time, threading, datetime
 from collections import deque
 from flask import Flask, request, jsonify, Response, render_template_string, g
@@ -24,7 +54,7 @@ KEYS = {
 }
 
 # The Round-Robin Model Pool (from environment)
-RAW_MODELS = os.environ.get("GEMINI_MODELS", "gemini-1.5-flash:15,gemini-1.5-pro:2").split(",")
+RAW_MODELS = os.environ.get("MODELS_POOL", os.environ.get("GEMINI_MODELS", "gemini-1.5-flash:15")).split(",")
 RR_MODELS = []
 for m in RAW_MODELS:
     if not m.strip(): continue
@@ -61,61 +91,82 @@ def determine_provider(model_name):
     model_name = model_name.lower()
     if "gpt" in model_name or "o1" in model_name:
         return "openai", "https://api.openai.com/v1/chat/completions"
-    elif "claude" in model_name:
-        # Assuming OpenAI compatible endpoint for Claude (e.g., OpenRouter or specific proxy)
-        return "claude", os.environ.get("CLAUDE_BASE_URL", "https://api.anthropic.com/v1/messages") 
-    elif "meta" in model_name or "mistral" in model_name:
+    elif "claude" in model_name or "anthropic" in model_name:
+        # We will use Anthropic native API URL by default
+        return "claude", os.environ.get("CLAUDE_BASE_URL", "https://api.anthropic.com/v1/messages")
+    elif "meta" in model_name or "mistral" in model_name or "llama" in model_name:
         return "huggingface", os.environ.get("HF_BASE_URL", "https://api-inference.huggingface.co/models/" + model_name + "/v1/chat/completions")
     else:
-        return "gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        return "gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions" 
+
+
+# Track key index per provider for round-robin
+provider_key_idx = {"gemini": 0, "openai": 0, "claude": 0, "huggingface": 0}
 
 def get_next_rr_combo():
-    # Gets the next model & key from the general Round-Robin pool (from GEMINI_MODELS)
-    global rr_key_idx, rr_model_idx
+    global rr_model_idx
     now = time.time()
     
     with state_lock:
-        provider_keys = KEYS["gemini"]
-        if not provider_keys or not RR_MODELS: return None, None, None, None
+        if not RR_MODELS: return None, None, None, None
         
-        total_combos = len(provider_keys) * len(RR_MODELS)
-        for _ in range(total_combos):
-            key = provider_keys[rr_key_idx]
+        # Loop through models in RR_MODELS
+        for _ in range(len(RR_MODELS)):
             model = RR_MODELS[rr_model_idx]
+            rr_model_idx = (rr_model_idx + 1) % len(RR_MODELS)
             
-            rr_model_idx += 1
-            if rr_model_idx >= len(RR_MODELS):
-                rr_model_idx = 0
-                rr_key_idx = (rr_key_idx + 1) % len(provider_keys)
+            provider, url = determine_provider(model['name'])
+            provider_keys = KEYS.get(provider, [])
+            
+            if not provider_keys:
+                continue # We don't have keys for this provider, try the next model!
                 
-            if key in key_penalties and now - key_penalties[key] < 86400:
-                continue
+            # Now round-robin the keys for THIS provider
+            p_idx = provider_key_idx.get(provider, 0)
+            
+            found_key = None
+            for _ in range(len(provider_keys)):
+                key = provider_keys[p_idx]
+                p_idx = (p_idx + 1) % len(provider_keys)
                 
-            history = clean_history(request_history.get(key, []))
-            request_history[key] = history
-            if len(history) < model['rpm']:
-                history.append(now)
-                provider, url = determine_provider(model['name'])
-                return key, model['name'], provider, url
+                if key in key_penalties and now - key_penalties[key] < 86400:
+                    continue
+                    
+                history = clean_history(request_history.get(key, []))
+                request_history[key] = history
+                if len(history) < model['rpm']:
+                    history.append(now)
+                    found_key = key
+                    break
+                    
+            provider_key_idx[provider] = p_idx
+            
+            if found_key:
+                return found_key, model['name'], provider, url
+                
         return None, None, None, None
 
 def get_key_for_provider(provider, rpm_limit=15):
-    # Just round-robins keys for a specific provider
     now = time.time()
     with state_lock:
         provider_keys = KEYS.get(provider, [])
         if not provider_keys: return None
         
-        # Simple random/round-robin (using time to avoid global state per provider for simplicity)
-        # Or we just find the first available key
-        for key in provider_keys:
+        p_idx = provider_key_idx.get(provider, 0)
+        
+        for _ in range(len(provider_keys)):
+            key = provider_keys[p_idx]
+            p_idx = (p_idx + 1) % len(provider_keys)
+            
             if key in key_penalties and now - key_penalties[key] < 86400:
                 continue
             history = clean_history(request_history.get(key, []))
             request_history[key] = history
             if len(history) < rpm_limit:
                 history.append(now)
+                provider_key_idx[provider] = p_idx
                 return key
+                
         return None
 
 # --- AUTH & LOGGING ---
@@ -173,13 +224,28 @@ def update_log_status(response):
 # --- ROUTER LOGIC ---
 def make_api_call(data, key, model_name, url):
     data["model"] = model_name
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    
+    # Provider specific header and payload translation
+    if "anthropic.com" in url:
+        headers = {
+            "x-api-key": key, 
+            "anthropic-version": "2023-06-01", 
+            "Content-Type": "application/json"
+        }
+        # Claude requires max_tokens natively
+        if "max_tokens" not in data:
+            data["max_tokens"] = 4096
+    else:
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     
     try:
         resp = requests.post(url, json=data, headers=headers, stream=True, timeout=60)
         if resp.status_code == 200:
             with state_lock:
                 metrics["successful_api_calls"] += 1
+            if hasattr(g, 'log_entry'):
+                g.log_entry["backend_key"] = key[:5] + "..." + key[-3:] if len(key) > 8 else "***"
+                g.log_entry["backend_model"] = model_name
             excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
             out_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
             return Response(resp.content, resp.status_code, out_headers)
@@ -231,6 +297,9 @@ def proxy_chat():
     
     try:
         resp = requests.post(fallback_url, json=data, headers=fallback_headers, timeout=60)
+        if hasattr(g, 'log_entry'):
+            g.log_entry["backend_key"] = "Web2API Fallback"
+            g.log_entry["backend_model"] = "Fallback Model"
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         out_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
         return Response(resp.content, resp.status_code, out_headers)
@@ -279,6 +348,7 @@ def view_secure_logs():
                         <th>Time</th>
                         <th>IP Address</th>
                         <th>Attempted Password</th>
+                        <th>Backend Model & Key</th>
                         <th>Status</th>
                         <th>Message / Prompt</th>
                     </tr>
@@ -287,11 +357,23 @@ def view_secure_logs():
                         <td style="white-space: nowrap; color: #888; font-size: 0.9em;">{{ log.time }}</td>
                         <td class="ip">{{ log.ip }}</td>
                         <td>
+                            <div style='font-size: 0.85em; color: #a1a1aa; background: #252525; padding: 4px; border-radius: 4px; text-align: center; margin-bottom: 5px;'>
+                                <strong>{{ log.backend_model or 'N/A' }}</strong><br>
+                                <span style='font-family: monospace; color: #facc15;'>{{ log.backend_key or 'N/A' }}</span>
+                            </div>
+                        </td>
+                        <td>
                             {% if log.is_correct %}
                                 <span class="pwd-correct">🛡️ {{ log.password_used }}</span>
                             {% else %}
                                 <span class="pwd-wrong">{{ log.password_used or "NONE" }}</span>
                             {% endif %}
+                        </td>
+                        <td>
+                            <div style='font-size: 0.85em; color: #a1a1aa; background: #252525; padding: 4px; border-radius: 4px; text-align: center; margin-bottom: 5px;'>
+                                <strong>{{ log.backend_model or 'N/A' }}</strong><br>
+                                <span style='font-family: monospace; color: #facc15;'>{{ log.backend_key or 'N/A' }}</span>
+                            </div>
                         </td>
                         <td>
                             {% if log.is_correct %}
@@ -316,12 +398,21 @@ def view_secure_logs():
 
 @app.route('/v1/models', methods=['GET', 'OPTIONS'])
 def proxy_models():
-    if request.method == 'OPTIONS':
-        return Response(status=200)
-    # Dummy models response to keep Hermes happy if it probes the endpoint
+    if request.method == 'OPTIONS': return Response(status=200)
+    
+    # Return the actual models configured in the environment
+    models_data = []
+    for m in RR_MODELS:
+        models_data.append({
+            "id": m["name"],
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": "google" if "gemini" in m["name"] else "openai"
+        })
+        
     return jsonify({
         "object": "list",
-        "data": [{"id": "gemini-1.5-flash", "object": "model", "created": int(time.time()), "owned_by": "google"}]
+        "data": models_data
     })
 
 @app.route('/add', methods=['POST'])
