@@ -129,7 +129,7 @@ def get_next_rr_combo():
                 key = provider_keys[p_idx]
                 p_idx = (p_idx + 1) % len(provider_keys)
                 
-                if key in key_penalties and now - key_penalties[key] < 86400:
+                if key in key_penalties and now < key_penalties[key]:
                     continue
                     
                 history = clean_history(request_history.get(key, []))
@@ -158,7 +158,7 @@ def get_key_for_provider(provider, rpm_limit=15):
             key = provider_keys[p_idx]
             p_idx = (p_idx + 1) % len(provider_keys)
             
-            if key in key_penalties and now - key_penalties[key] < 86400:
+            if key in key_penalties and now < key_penalties[key]:
                 continue
             history = clean_history(request_history.get(key, []))
             request_history[key] = history
@@ -249,11 +249,20 @@ def make_api_call(data, key, model_name, url):
             excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
             out_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
             return Response(resp.content, resp.status_code, out_headers)
-        elif resp.status_code in [429, 403, 400]:
+        elif resp.status_code == 429:
+            # Rate Limit: Block for 24 hours
             with state_lock:
-                key_penalties[key] = time.time()
+                key_penalties[key] = time.time() + 86400
                 metrics["rate_limit_hits"] += 1
             return None # Trigger fallback
+        elif resp.status_code in [500, 503]:
+            # High Demand / Server Error: Block for 5 minutes
+            with state_lock:
+                key_penalties[key] = time.time() + 300
+            return None
+        elif resp.status_code in [403, 400, 404]:
+            # Wrong Model / Bad Request: DO NOT BLOCK at all!
+            return None
         else:
             return None # Trigger fallback
     except Exception:
@@ -432,10 +441,16 @@ def add_key_model():
             RR_MODELS.append({"name": data["model"], "rpm": int(data["rpm"])})
     return jsonify({"status": "success", "keys_count": {p: len(k) for p,k in KEYS.items()}, "models": RR_MODELS})
     
+@app.route('/clear', methods=['GET'])
+def clear_penalties():
+    with state_lock:
+        key_penalties.clear()
+    return jsonify({"status": "cleared"})
+    
 @app.route('/status', methods=['GET'])
 def get_status():
     now = time.time()
-    penalized = {k[:5]+"...": round((86400 - (now - ts))/3600, 1) for k, ts in key_penalties.items()}
+    penalized = {k[:5]+"...": round((300 - (now - ts))/3600, 1) for k, ts in key_penalties.items()}
     return jsonify({
         "metrics": metrics,
         "active_keys": {p: len(k) for p,k in KEYS.items()},
