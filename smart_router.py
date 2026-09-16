@@ -5,29 +5,41 @@ from functools import wraps
 from collections import deque
 import requests
 
+
+import os, json, time, threading, datetime
+from collections import deque
+from flask import Flask, request, jsonify, Response, render_template_string, g
+from functools import wraps
+import requests
+
 app = Flask(__name__)
 
-# Config loaded from Environment
-RAW_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
-RAW_MODELS = os.environ.get("GEMINI_MODELS", "gemini-1.5-flash:15,gemini-1.5-pro:2").split(",")
+# --- CONFIG & STATE ---
+# Environment variables for keys
+KEYS = {
+    "gemini": [k.strip() for k in os.environ.get("GEMINI_API_KEYS", "").split(",") if k.strip()],
+    "openai": [k.strip() for k in os.environ.get("OPENAI_API_KEYS", "").split(",") if k.strip()],
+    "claude": [k.strip() for k in os.environ.get("CLAUDE_API_KEYS", "").split(",") if k.strip()],
+    "huggingface": [k.strip() for k in os.environ.get("HF_API_KEYS", "").split(",") if k.strip()]
+}
 
-API_KEYS = [k.strip() for k in RAW_KEYS if k.strip()]
-MODELS = []
+# The Round-Robin Model Pool (from environment)
+RAW_MODELS = os.environ.get("GEMINI_MODELS", "gemini-1.5-flash:15,gemini-1.5-pro:2").split(",")
+RR_MODELS = []
 for m in RAW_MODELS:
     if not m.strip(): continue
     parts = m.split(":")
     name = parts[0].strip()
-    rpm = int(parts[1].strip()) if len(parts) > 1 else 5
-    MODELS.append({"name": name, "rpm": rpm})
+    rpm = int(parts[1].strip()) if len(parts) > 1 else 15
+    RR_MODELS.append({"name": name, "rpm": rpm})
 
-if not MODELS:
-    MODELS = [{"name": "gemini-1.5-flash", "rpm": 15}]
+if not RR_MODELS:
+    RR_MODELS = [{"name": "gemini-1.5-flash", "rpm": 15}]
 
-# State tracking
-key_penalties = {}  # key -> timestamp when it was banned
-request_history = {} # (key, model) -> list of timestamps
+key_penalties = {}  # key -> timestamp
+request_history = {} # key -> list of timestamps
+request_logs = deque(maxlen=150)
 
-# Global Metrics
 metrics = {
     "total_incoming_requests": 0,
     "successful_api_calls": 0,
@@ -38,121 +50,193 @@ metrics = {
 }
 
 state_lock = threading.Lock()
-current_key_idx = 0
-current_model_idx = 0
+rr_key_idx = 0
+rr_model_idx = 0
 
 def clean_history(history):
     now = time.time()
     return [ts for ts in history if now - ts < 60.0]
 
-def get_next_available_combo():
-    global current_key_idx, current_model_idx
+def determine_provider(model_name):
+    model_name = model_name.lower()
+    if "gpt" in model_name or "o1" in model_name:
+        return "openai", "https://api.openai.com/v1/chat/completions"
+    elif "claude" in model_name:
+        # Assuming OpenAI compatible endpoint for Claude (e.g., OpenRouter or specific proxy)
+        return "claude", os.environ.get("CLAUDE_BASE_URL", "https://api.anthropic.com/v1/messages") 
+    elif "meta" in model_name or "mistral" in model_name:
+        return "huggingface", os.environ.get("HF_BASE_URL", "https://api-inference.huggingface.co/models/" + model_name + "/v1/chat/completions")
+    else:
+        return "gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+
+def get_next_rr_combo():
+    # Gets the next model & key from the general Round-Robin pool (from GEMINI_MODELS)
+    global rr_key_idx, rr_model_idx
     now = time.time()
     
     with state_lock:
-        if not API_KEYS or not MODELS:
-            return None, None
+        provider_keys = KEYS["gemini"]
+        if not provider_keys or not RR_MODELS: return None, None, None, None
         
-        total_combos = len(API_KEYS) * len(MODELS)
+        total_combos = len(provider_keys) * len(RR_MODELS)
         for _ in range(total_combos):
-            key = API_KEYS[current_key_idx]
-            model = MODELS[current_model_idx]
+            key = provider_keys[rr_key_idx]
+            model = RR_MODELS[rr_model_idx]
             
-            # Advance pointers
-            current_model_idx += 1
-            if current_model_idx >= len(MODELS):
-                current_model_idx = 0
-                current_key_idx = (current_key_idx + 1) % len(API_KEYS)
-            
-            # Check 24-hour penalty (86400 seconds)
-            if key in key_penalties:
-                if now - key_penalties[key] < 86400:
-                    continue
-                else:
-                    del key_penalties[key]
-                    
-            # Check RPM limit
-            combo_id = f"{key}_{model['name']}"
-            history = request_history.get(combo_id, [])
-            history = clean_history(history)
-            request_history[combo_id] = history
-            
+            rr_model_idx += 1
+            if rr_model_idx >= len(RR_MODELS):
+                rr_model_idx = 0
+                rr_key_idx = (rr_key_idx + 1) % len(provider_keys)
+                
+            if key in key_penalties and now - key_penalties[key] < 86400:
+                continue
+                
+            history = clean_history(request_history.get(key, []))
+            request_history[key] = history
             if len(history) < model['rpm']:
                 history.append(now)
-                return key, model['name']
-                
-        return None, None
+                provider, url = determine_provider(model['name'])
+                return key, model['name'], provider, url
+        return None, None, None, None
 
-request_logs = deque(maxlen=150)
+def get_key_for_provider(provider, rpm_limit=15):
+    # Just round-robins keys for a specific provider
+    now = time.time()
+    with state_lock:
+        provider_keys = KEYS.get(provider, [])
+        if not provider_keys: return None
+        
+        # Simple random/round-robin (using time to avoid global state per provider for simplicity)
+        # Or we just find the first available key
+        for key in provider_keys:
+            if key in key_penalties and now - key_penalties[key] < 86400:
+                continue
+            history = clean_history(request_history.get(key, []))
+            request_history[key] = history
+            if len(history) < rpm_limit:
+                history.append(now)
+                return key
+        return None
 
+# --- AUTH & LOGGING ---
 def check_browser_auth(username, password):
-    expected_pass = os.environ.get("PASSWORD", "")
-    return password == expected_pass
-
-def request_browser_login():
-    return Response(
-        'Login Required to view logs.', 401,
-        {'WWW-Authenticate': 'Basic realm="Admin Login (Use any username, put your API PASSWORD in password field)"'})
+    return password == os.environ.get("PASSWORD", "")
 
 def requires_browser_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         auth = request.authorization
         if not auth or not check_browser_auth(auth.username, auth.password):
-            return request_browser_login()
+            return Response('Login Required', 401, {'WWW-Authenticate': 'Basic realm="Admin Login"'})
         return f(*args, **kwargs)
     return decorated
 
 @app.before_request
 def strict_password_and_log():
-    if request.method == 'OPTIONS':
-        return
-        
-    # Exclude system routes from API password check (Logs has its own browser auth)
-    if request.path in ['/ping', '/healthz', '/logs']:
-        return
+    if request.method == 'OPTIONS': return
+    if request.path in ['/ping', '/healthz', '/logs']: return
         
     expected_pass = os.environ.get("PASSWORD", "")
     auth_header = request.headers.get("Authorization", "")
-    
     is_correct = (auth_header == f"Bearer {expected_pass}")
     
-    # Extract message
     msg = ""
     if request.is_json:
         try:
             body = request.get_json(silent=True) or {}
-            if "messages" in body and isinstance(body["messages"], list) and len(body["messages"]) > 0:
+            if "messages" in body and len(body.get("messages", [])) > 0:
                 msg = body["messages"][-1].get("content", "")
-        except:
-            pass
+        except: pass
 
     log_entry = {
         "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "ip": request.headers.get("Cf-Connecting-Ip", request.headers.get("X-Forwarded-For", request.remote_addr)),
+        "ip": request.headers.get("Cf-Connecting-Ip", request.remote_addr),
         "path": request.path,
-        "password_used": "*** HIDDEN (CORRECT) ***" if is_correct else auth_header,
+        "password_used": "*** HIDDEN ***" if is_correct else auth_header,
         "is_correct": is_correct,
-        "message": msg[:300] + "..." if len(msg) > 300 else msg,
+        "message": msg[:300] + "..." if len(msg)>300 else msg,
         "status": "Pending..."
     }
-    
     g.log_entry = log_entry
     request_logs.appendleft(log_entry)
     
     if not is_correct:
-        log_entry["status"] = "401 Blocked (Hacker/Wrong Pass)"
-        return jsonify({"error": "Unauthorized Access. Invalid Password."}), 401
+        log_entry["status"] = "401 Blocked"
+        return jsonify({"error": "Unauthorized Access."}), 401
 
 @app.after_request
 def update_log_status(response):
-    if hasattr(g, 'log_entry'):
-        if g.log_entry["status"] == "Pending...":
-            if response.status_code == 200:
-                g.log_entry["status"] = "200 Success"
-            else:
-                g.log_entry["status"] = f"{response.status_code} Failed"
+    if hasattr(g, 'log_entry') and g.log_entry["status"] == "Pending...":
+        g.log_entry["status"] = f"{response.status_code} Success" if response.status_code == 200 else f"{response.status_code} Failed"
     return response
+
+# --- ROUTER LOGIC ---
+def make_api_call(data, key, model_name, url):
+    data["model"] = model_name
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+    
+    try:
+        resp = requests.post(url, json=data, headers=headers, stream=True, timeout=60)
+        if resp.status_code == 200:
+            with state_lock:
+                metrics["successful_api_calls"] += 1
+            excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+            out_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
+            return Response(resp.content, resp.status_code, out_headers)
+        elif resp.status_code in [429, 403, 400]:
+            with state_lock:
+                key_penalties[key] = time.time()
+                metrics["rate_limit_hits"] += 1
+            return None # Trigger fallback
+        else:
+            return None # Trigger fallback
+    except Exception:
+        return None # Trigger fallback
+
+@app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
+def proxy_chat():
+    if request.method == 'OPTIONS': return Response(status=200)
+    with state_lock: metrics["total_incoming_requests"] += 1
+        
+    data = request.json
+    requested_model = data.get("model", "auto")
+    
+    # 1. SPECIFIC MODEL LOGIC
+    if requested_model != "auto":
+        provider, url = determine_provider(requested_model)
+        
+        # Try up to 3 keys for this specific provider
+        for _ in range(3):
+            key = get_key_for_provider(provider)
+            if not key: break # No keys available for this provider
+            
+            response = make_api_call(data, key, requested_model, url)
+            if response: return response
+            
+        print(f"Specific model {requested_model} failed. Falling back to ALL ROUND ROBIN.")
+    
+    # 2. ALL ROUND-ROBIN FALLBACK (or if 'auto' was requested)
+    while True:
+        key, rr_model_name, provider, url = get_next_rr_combo()
+        if not key: break
+        
+        response = make_api_call(data, key, rr_model_name, url)
+        if response: return response
+
+    # 3. ABSOLUTE FALLBACK (Web2API)
+    print("Falling back to Web2API...")
+    with state_lock: metrics["fallback_calls"] += 1
+    fallback_url = "http://127.0.0.1:8081/v1/chat/completions"
+    fallback_headers = {k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']}
+    
+    try:
+        resp = requests.post(fallback_url, json=data, headers=fallback_headers, timeout=60)
+        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+        out_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
+        return Response(resp.content, resp.status_code, out_headers)
+    except:
+        with state_lock: metrics["failed_requests"] += 1
+        return jsonify({"error": {"message": "All APIs failed."}}), 500
 
 @app.route('/logs', methods=['GET'])
 @requires_browser_auth
@@ -242,12 +326,18 @@ def proxy_chat():
     original_auth = request.headers.get("Authorization", "")
     
     # Try Real APIs
-    while True:
-        key, model_name = get_next_available_combo()
+    requested_model = data.get("model", "gemini-1.5-flash") # Read model from Telegram Agent
+    
+    # Try keys for the requested model in round-robin
+    keys_tried = 0
+    while keys_tried < len(API_KEYS):
+        keys_tried += 1
+        key = get_next_available_key(rpm_limit=15)
+        
         if not key:
             break
             
-        data["model"] = model_name
+        # Do NOT overwrite data["model"], use what the agent requested!
         headers = {
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json"
@@ -262,29 +352,27 @@ def proxy_chat():
                     safe_key = key[:5] + "..."
                     if safe_key not in metrics["usage_by_key"]:
                         metrics["usage_by_key"][safe_key] = {}
-                    if model_name not in metrics["usage_by_key"][safe_key]:
-                        metrics["usage_by_key"][safe_key][model_name] = 0
-                    metrics["usage_by_key"][safe_key][model_name] += 1
+                    if requested_model not in metrics["usage_by_key"][safe_key]:
+                        metrics["usage_by_key"][safe_key][requested_model] = 0
+                    metrics["usage_by_key"][safe_key][requested_model] += 1
                     
                 excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
                 out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
                                if name.lower() not in excluded_headers]
                 return Response(resp.content, resp.status_code, out_headers)
-            elif resp.status_code in [429, 403]:
+            elif resp.status_code in [429, 403, 400]:
+                # If 400, maybe the model name is wrong, but we treat it as failure
                 with state_lock:
                     key_penalties[key] = time.time()
                     metrics["rate_limit_hits"] += 1
-                print(f"Key {key[:5]}... hit 429/403. Penalized for 24h.")
                 continue
             elif resp.status_code in [500, 503]:
-                print(f"Model {model_name} overloaded (500/503). Trying next combo...")
                 continue
             else:
                 with state_lock:
                     metrics["failed_requests"] += 1
                 return Response(resp.content, resp.status_code)
         except Exception as e:
-            print(f"API call error: {e}")
             continue
             
     # FALLBACK to Web2API
@@ -327,11 +415,14 @@ def add_key_model():
         
     data = request.json
     with state_lock:
-        if "key" in data and data["key"] not in API_KEYS:
-            API_KEYS.append(data["key"])
+        # Defaults to adding gemini keys if provider not specified
+        provider = data.get("provider", "gemini")
+        if provider not in KEYS: KEYS[provider] = []
+        if "key" in data and data["key"] not in KEYS[provider]:
+            KEYS[provider].append(data["key"])
         if "model" in data and "rpm" in data:
-            MODELS.append({"name": data["model"], "rpm": int(data["rpm"])})
-    return jsonify({"status": "success", "keys_count": len(API_KEYS), "models": MODELS})
+            RR_MODELS.append({"name": data["model"], "rpm": int(data["rpm"])})
+    return jsonify({"status": "success", "keys_count": {p: len(k) for p,k in KEYS.items()}, "models": RR_MODELS})
     
 @app.route('/status', methods=['GET'])
 def get_status():
@@ -339,9 +430,9 @@ def get_status():
     penalized = {k[:5]+"...": round((86400 - (now - ts))/3600, 1) for k, ts in key_penalties.items()}
     return jsonify({
         "metrics": metrics,
-        "active_keys": len(API_KEYS),
+        "active_keys": {p: len(k) for p,k in KEYS.items()},
         "penalized_keys_hours_left": penalized,
-        "models": MODELS
+        "models": RR_MODELS
     })
 
 if __name__ == '__main__':
