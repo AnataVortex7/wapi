@@ -82,104 +82,25 @@ def get_next_available_combo():
         return None, None
 
 
-request_logs = deque(maxlen=500)
 
 @app.before_request
-def log_request_info():
-    # Don't log system endpoints to avoid spam
-    if request.path in ['/logs', '/debug_auth', '/status', '/v1/models']:
+def strict_password_check():
+    if request.method == 'OPTIONS':
         return
         
-    auth_header = request.headers.get('Authorization', 'None')
-    expected_pass = os.environ.get("API_PASSWORD", "Swapnpurti@1181")
-    is_correct = (auth_header == f"Bearer {expected_pass}")
+    # Allowed routes without password (if any)
+    if request.path in ['/ping', '/healthz']:
+        return
+        
+    expected_pass = os.environ.get("PASSWORD", "")
+    # If the user also wants to support API_PASSWORD for backward compatibility, uncomment:
+    # if not expected_pass: expected_pass = os.environ.get("API_PASSWORD", "Swapnpurti@1181")
     
-    # Extract the actual message asked by the user (if it's a chat request)
-    msg = ""
-    if request.is_json:
-        try:
-            body = request.get_json(silent=True) or {}
-            if "messages" in body and isinstance(body["messages"], list) and len(body["messages"]) > 0:
-                # get the last message (usually user's prompt)
-                msg = body["messages"][-1].get("content", "")
-        except:
-            pass
-
-    log_entry = {
-        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "ip": request.headers.get("Cf-Connecting-Ip", request.headers.get("X-Forwarded-For", request.remote_addr)),
-        "path": request.path,
-        "password_used": auth_header,
-        "is_password_correct": is_correct,
-        "message_preview": msg[:200] + ("..." if len(msg) > 200 else "")
-    }
+    auth_header = request.headers.get("Authorization", "")
     
-    request_logs.appendleft(log_entry)
+    if auth_header != f"Bearer {expected_pass}":
+        return jsonify({"error": "Unauthorized Access. Invalid Password."}), 401
 
-@app.route('/logs', methods=['GET'])
-def view_logs():
-    html_template = '''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>API Request Logs</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #f0f2f5; }
-            .container { max-width: 1200px; margin: 0 auto; }
-            h1 { color: #1a1a1a; text-align: center; margin-bottom: 30px; }
-            .table-wrapper { background: white; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); overflow-x: auto; }
-            table { width: 100%; border-collapse: collapse; min-width: 800px; }
-            th, td { padding: 15px; text-align: left; border-bottom: 1px solid #ddd; }
-            th { background-color: #2c3e50; color: white; font-weight: 600; }
-            tr:hover { background-color: #f8f9fa; }
-            .status-correct { color: #155724; background-color: #d4edda; padding: 5px 10px; border-radius: 4px; font-weight: bold; font-size: 0.9em; }
-            .status-wrong { color: #721c24; background-color: #f8d7da; padding: 5px 10px; border-radius: 4px; font-weight: bold; font-size: 0.9em; }
-            .msg { max-width: 350px; white-space: pre-wrap; word-break: break-word; font-size: 0.95em; color: #333; }
-            .pwd { font-family: monospace; background: #eee; padding: 3px 6px; border-radius: 3px; }
-            .empty-msg { text-align: center; padding: 40px; color: #666; font-size: 1.1em; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🛡️ API Request Logs</h1>
-            <div class="table-wrapper">
-                {% if logs %}
-                <table>
-                    <tr>
-                        <th>Time</th>
-                        <th>IP Address</th>
-                        <th>Path</th>
-                        <th>Password Used</th>
-                        <th>Status</th>
-                        <th>Message / Prompt</th>
-                    </tr>
-                    {% for log in logs %}
-                    <tr>
-                        <td style="white-space: nowrap; color: #555;">{{ log.time }}</td>
-                        <td style="font-family: monospace;">{{ log.ip }}</td>
-                        <td>{{ log.path }}</td>
-                        <td><span class="pwd">{{ log.password_used }}</span></td>
-                        <td>
-                            {% if log.is_password_correct %}
-                                <span class="status-correct">Correct</span>
-                            {% else %}
-                                <span class="status-wrong">Wrong</span>
-                            {% endif %}
-                        </td>
-                        <td class="msg">{{ log.message_preview or '<span style="color: #999; font-style: italic;">No message</span>'|safe }}</td>
-                    </tr>
-                    {% endfor %}
-                </table>
-                {% else %}
-                <div class="empty-msg">No requests logged yet. Try sending a request to the API!</div>
-                {% endif %}
-            </div>
-        </div>
-    </body>
-    </html>
-    '''
-    return render_template_string(html_template, logs=list(request_logs))
 
 
 
@@ -250,10 +171,6 @@ def proxy_chat():
     # Forward all original headers transparently (except host)
     fallback_headers = {k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']}
     
-    # If Hermes sent absolutely NO auth, WebAPI will fail. So we inject it ONLY if it's missing.
-    if "Authorization" not in fallback_headers:
-        expected_pass = os.environ.get("API_PASSWORD", "Swapnpurti@1181")
-        fallback_headers["Authorization"] = f"Bearer {expected_pass}"
         
     try:
         resp = requests.post(fallback_url, json=request.json, headers=fallback_headers)
@@ -267,30 +184,6 @@ def proxy_chat():
         return jsonify({"error": {"message": "All APIs failed and Fallback is down.", "type": "server_error"}}), 500
 
 
-@app.route('/debug_auth', methods=['GET', 'POST', 'OPTIONS'])
-def debug_auth():
-    if request.method == 'OPTIONS':
-        return Response(status=200)
-    
-    auth_header = request.headers.get('Authorization')
-    expected_pass = os.environ.get("API_PASSWORD", "Swapnpurti@1181")
-    
-    debug_info = {
-        "method": request.method,
-        "url": request.url,
-        "headers": dict(request.headers),
-        "auth_header_present": auth_header is not None,
-        "auth_header_value": auth_header,
-        "is_bearer_token": auth_header.startswith("Bearer ") if auth_header else False,
-        "extracted_token": auth_header.split(" ")[1] if auth_header and auth_header.startswith("Bearer ") else None,
-        "matches_expected_password": (auth_header == f"Bearer {expected_pass}") if auth_header else False,
-        "body": request.get_json(silent=True) or request.get_data(as_text=True)
-    }
-    
-    return jsonify({
-        "message": "Debug Route: Here is exactly how your request was received.",
-        "debug_info": debug_info
-    })
 
 @app.route('/v1/models', methods=['GET', 'OPTIONS'])
 def proxy_models():
@@ -304,7 +197,7 @@ def proxy_models():
 
 @app.route('/add', methods=['POST'])
 def add_key_model():
-    expected_pass = os.environ.get("API_PASSWORD", "")
+    expected_pass = os.environ.get("PASSWORD", "")
     if request.headers.get("Authorization") != f"Bearer {expected_pass}":
         return jsonify({"error": "Unauthorized"}), 401
         
