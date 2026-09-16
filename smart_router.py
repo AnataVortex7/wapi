@@ -143,10 +143,15 @@ def proxy_chat():
         metrics["fallback_calls"] += 1
         
     fallback_url = "http://127.0.0.1:8081/v1/chat/completions"
-    fallback_headers = {
-        "Authorization": original_auth,
-        "Content-Type": "application/json"
-    }
+    
+    # Forward all original headers transparently (except host)
+    fallback_headers = {k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']}
+    
+    # If Hermes sent absolutely NO auth, WebAPI will fail. So we inject it ONLY if it's missing.
+    if "Authorization" not in fallback_headers:
+        expected_pass = os.environ.get("API_PASSWORD", "Swapnpurti@1181")
+        fallback_headers["Authorization"] = f"Bearer {expected_pass}"
+        
     try:
         resp = requests.post(fallback_url, json=request.json, headers=fallback_headers)
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
@@ -157,6 +162,16 @@ def proxy_chat():
         with state_lock:
             metrics["failed_requests"] += 1
         return jsonify({"error": {"message": "All APIs failed and Fallback is down.", "type": "server_error"}}), 500
+
+@app.route('/v1/models', methods=['GET', 'OPTIONS'])
+def proxy_models():
+    if request.method == 'OPTIONS':
+        return Response(status=200)
+    # Dummy models response to keep Hermes happy if it probes the endpoint
+    return jsonify({
+        "object": "list",
+        "data": [{"id": "gemini-1.5-flash", "object": "model", "created": int(time.time()), "owned_by": "google"}]
+    })
 
 @app.route('/add', methods=['POST'])
 def add_key_model():
