@@ -1,6 +1,8 @@
 import os, json, time, threading, datetime
 from collections import deque
-from flask import Flask, request, jsonify, Response, render_template_string
+from flask import Flask, request, jsonify, Response, render_template_string, g
+from functools import wraps
+from collections import deque
 import requests
 
 app = Flask(__name__)
@@ -81,28 +83,151 @@ def get_next_available_combo():
                 
         return None, None
 
+request_logs = deque(maxlen=150)
 
+def check_browser_auth(username, password):
+    expected_pass = os.environ.get("PASSWORD", "")
+    return password == expected_pass
+
+def request_browser_login():
+    return Response(
+        'Login Required to view logs.', 401,
+        {'WWW-Authenticate': 'Basic realm="Admin Login (Use any username, put your API PASSWORD in password field)"'})
+
+def requires_browser_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_browser_auth(auth.username, auth.password):
+            return request_browser_login()
+        return f(*args, **kwargs)
+    return decorated
 
 @app.before_request
-def strict_password_check():
+def strict_password_and_log():
     if request.method == 'OPTIONS':
         return
         
-    # Allowed routes without password (if any)
-    if request.path in ['/ping', '/healthz']:
+    # Exclude system routes from API password check (Logs has its own browser auth)
+    if request.path in ['/ping', '/healthz', '/logs']:
         return
         
     expected_pass = os.environ.get("PASSWORD", "")
-    # If the user also wants to support API_PASSWORD for backward compatibility, uncomment:
-    # if not expected_pass: expected_pass = os.environ.get("API_PASSWORD", "Swapnpurti@1181")
-    
     auth_header = request.headers.get("Authorization", "")
     
-    if auth_header != f"Bearer {expected_pass}":
+    is_correct = (auth_header == f"Bearer {expected_pass}")
+    
+    # Extract message
+    msg = ""
+    if request.is_json:
+        try:
+            body = request.get_json(silent=True) or {}
+            if "messages" in body and isinstance(body["messages"], list) and len(body["messages"]) > 0:
+                msg = body["messages"][-1].get("content", "")
+        except:
+            pass
+
+    log_entry = {
+        "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "ip": request.headers.get("Cf-Connecting-Ip", request.headers.get("X-Forwarded-For", request.remote_addr)),
+        "path": request.path,
+        "password_used": "*** HIDDEN (CORRECT) ***" if is_correct else auth_header,
+        "is_correct": is_correct,
+        "message": msg[:300] + "..." if len(msg) > 300 else msg,
+        "status": "Pending..."
+    }
+    
+    g.log_entry = log_entry
+    request_logs.appendleft(log_entry)
+    
+    if not is_correct:
+        log_entry["status"] = "401 Blocked (Hacker/Wrong Pass)"
         return jsonify({"error": "Unauthorized Access. Invalid Password."}), 401
 
+@app.after_request
+def update_log_status(response):
+    if hasattr(g, 'log_entry'):
+        if g.log_entry["status"] == "Pending...":
+            if response.status_code == 200:
+                g.log_entry["status"] = "200 Success"
+            else:
+                g.log_entry["status"] = f"{response.status_code} Failed"
+    return response
 
-
+@app.route('/logs', methods=['GET'])
+@requires_browser_auth
+def view_secure_logs():
+    html = '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Secure API Logs</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #121212; color: #e0e0e0; }
+            .container { max-width: 1400px; margin: 0 auto; }
+            h1 { color: #ffffff; text-align: center; margin-bottom: 30px; text-shadow: 0 0 10px rgba(255,255,255,0.2); }
+            .table-wrapper { background: #1e1e1e; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); overflow-x: auto; border: 1px solid #333; }
+            table { width: 100%; border-collapse: collapse; min-width: 900px; }
+            th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #333; }
+            th { background-color: #2c2c2c; color: #ffffff; font-weight: 600; font-size: 0.95em; text-transform: uppercase; letter-spacing: 0.5px; }
+            tr:hover { background-color: #252525; }
+            .status-correct { color: #4ade80; font-weight: bold; }
+            .status-wrong { color: #f87171; font-weight: bold; }
+            .msg { max-width: 400px; white-space: pre-wrap; word-break: break-word; font-size: 0.9em; color: #a1a1aa; background: #18181b; padding: 8px; border-radius: 4px; }
+            .pwd-wrong { font-family: monospace; color: #fca5a5; background: #451a1a; padding: 3px 6px; border-radius: 3px; font-size: 0.9em; }
+            .pwd-correct { font-family: monospace; color: #4ade80; font-style: italic; font-size: 0.9em; }
+            .ip { font-family: monospace; color: #93c5fd; }
+            .badge { padding: 4px 8px; border-radius: 4px; font-size: 0.85em; font-weight: bold; }
+            .bg-green { background: rgba(74, 222, 128, 0.2); color: #4ade80; }
+            .bg-red { background: rgba(248, 113, 113, 0.2); color: #f87171; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🔐 Secure API Access Logs</h1>
+            <p style="text-align: center; color: #888;">Showing up to last 150 requests.</p>
+            <div class="table-wrapper">
+                {% if logs %}
+                <table>
+                    <tr>
+                        <th>Time</th>
+                        <th>IP Address</th>
+                        <th>Attempted Password</th>
+                        <th>Status</th>
+                        <th>Message / Prompt</th>
+                    </tr>
+                    {% for log in logs %}
+                    <tr>
+                        <td style="white-space: nowrap; color: #888; font-size: 0.9em;">{{ log.time }}</td>
+                        <td class="ip">{{ log.ip }}</td>
+                        <td>
+                            {% if log.is_correct %}
+                                <span class="pwd-correct">🛡️ {{ log.password_used }}</span>
+                            {% else %}
+                                <span class="pwd-wrong">{{ log.password_used or "NONE" }}</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if log.is_correct %}
+                                <span class="badge bg-green">{{ log.status }}</span>
+                            {% else %}
+                                <span class="badge bg-red">{{ log.status }}</span>
+                            {% endif %}
+                        </td>
+                        <td><div class="msg">{{ log.message or "No message" }}</div></td>
+                    </tr>
+                    {% endfor %}
+                </table>
+                {% else %}
+                <div style="text-align: center; padding: 50px; color: #666;">No requests logged yet.</div>
+                {% endif %}
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+    return render_template_string(html, logs=list(request_logs))
 
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 def proxy_chat():
@@ -182,8 +307,6 @@ def proxy_chat():
         with state_lock:
             metrics["failed_requests"] += 1
         return jsonify({"error": {"message": "All APIs failed and Fallback is down.", "type": "server_error"}}), 500
-
-
 
 @app.route('/v1/models', methods=['GET', 'OPTIONS'])
 def proxy_models():
