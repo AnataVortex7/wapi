@@ -245,6 +245,10 @@ def make_api_call(data, key, model_name, url):
             data["max_tokens"] = 4096
     else:
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        # Strip unsupported parameters for Gemini to prevent 400 Bad Request
+        if "generativelanguage" in url:
+            for k in ["frequency_penalty", "presence_penalty", "logit_bias", "user", "seed"]:
+                data.pop(k, None)
     
     try:
         resp = requests.post(url, json=data, headers=headers, stream=True, timeout=60)
