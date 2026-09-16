@@ -163,6 +163,32 @@ def proxy_chat():
             metrics["failed_requests"] += 1
         return jsonify({"error": {"message": "All APIs failed and Fallback is down.", "type": "server_error"}}), 500
 
+
+@app.route('/debug_auth', methods=['GET', 'POST', 'OPTIONS'])
+def debug_auth():
+    if request.method == 'OPTIONS':
+        return Response(status=200)
+    
+    auth_header = request.headers.get('Authorization')
+    expected_pass = os.environ.get("API_PASSWORD", "Swapnpurti@1181")
+    
+    debug_info = {
+        "method": request.method,
+        "url": request.url,
+        "headers": dict(request.headers),
+        "auth_header_present": auth_header is not None,
+        "auth_header_value": auth_header,
+        "is_bearer_token": auth_header.startswith("Bearer ") if auth_header else False,
+        "extracted_token": auth_header.split(" ")[1] if auth_header and auth_header.startswith("Bearer ") else None,
+        "matches_expected_password": (auth_header == f"Bearer {expected_pass}") if auth_header else False,
+        "body": request.get_json(silent=True) or request.get_data(as_text=True)
+    }
+    
+    return jsonify({
+        "message": "Debug Route: Here is exactly how your request was received.",
+        "debug_info": debug_info
+    })
+
 @app.route('/v1/models', methods=['GET', 'OPTIONS'])
 def proxy_models():
     if request.method == 'OPTIONS':
