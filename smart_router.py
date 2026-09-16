@@ -185,7 +185,7 @@ def requires_browser_auth(f):
 @app.before_request
 def strict_password_and_log():
     if request.method == 'OPTIONS': return
-    if request.path in ['/ping', '/healthz', '/logs']: return
+    if request.path in ['/ping', '/healthz', '/logs', '/clear', '/status']: return
         
     expected_pass = os.environ.get("PASSWORD", "")
     auth_header = request.headers.get("Authorization", "")
@@ -199,10 +199,18 @@ def strict_password_and_log():
                 msg = body["messages"][-1].get("content", "")
         except: pass
 
+    req_model = "auto"
+    if request.is_json:
+        try:
+            b = request.get_json(silent=True) or {}
+            req_model = b.get("model", "auto")
+        except: pass
+
     log_entry = {
         "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "ip": request.headers.get("Cf-Connecting-Ip", request.remote_addr),
         "path": request.path,
+        "requested_model": req_model,
         "password_used": "*** HIDDEN ***" if is_correct else auth_header,
         "is_correct": is_correct,
         "message": msg[:300] + "..." if len(msg)>300 else msg,
@@ -245,7 +253,11 @@ def make_api_call(data, key, model_name, url):
                 metrics["successful_api_calls"] += 1
             if hasattr(g, 'log_entry'):
                 g.log_entry["backend_key"] = key[:5] + "..." + key[-3:] if len(key) > 8 else "***"
-                g.log_entry["backend_model"] = model_name
+                req_m = g.log_entry.get("requested_model", "auto")
+                if req_m != "auto" and req_m != model_name:
+                    g.log_entry["backend_model"] = f"{req_m} ❌ ➔ {model_name}"
+                else:
+                    g.log_entry["backend_model"] = model_name
             excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
             out_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
             return Response(resp.content, resp.status_code, out_headers)
@@ -442,12 +454,14 @@ def add_key_model():
     return jsonify({"status": "success", "keys_count": {p: len(k) for p,k in KEYS.items()}, "models": RR_MODELS})
     
 @app.route('/clear', methods=['GET'])
+@requires_browser_auth
 def clear_penalties():
     with state_lock:
         key_penalties.clear()
     return jsonify({"status": "cleared"})
     
 @app.route('/status', methods=['GET'])
+@requires_browser_auth
 def get_status():
     now = time.time()
     penalized = {k[:5]+"...": round((300 - (now - ts))/3600, 1) for k, ts in key_penalties.items()}
