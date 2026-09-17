@@ -193,16 +193,16 @@ def view_logs():
         <style>
             body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #121212; color: #e0e0e0; }
             .container { max-width: 1400px; margin: 0 auto; }
-            h1 { color: #ffffff; text-align: center; margin-bottom: 20px; text-shadow: 0 0 10px rgba(255,255,255,0.2); }
+            h1 { color: #ffffff; text-align: center; margin-bottom: 20px; text-shadow: 0 0 10px rgba(255,255,255,0.2); display: flex; justify-content: center; align-items: center; gap: 15px;}
             
             /* Status Panel */
             .status-panel { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 25px; }
             .card { background: #1e1e1e; border-radius: 8px; padding: 15px; flex: 1; min-width: 200px; border: 1px solid #333; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }
-            .card h3 { margin: 0 0 10px 0; font-size: 0.9em; color: #888; text-transform: uppercase; letter-spacing: 1px; }
+            .card h3 { margin: 0 0 10px 0; font-size: 0.9em; color: #888; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #333; padding-bottom: 5px; }
             .card .val { font-size: 1.8em; font-weight: bold; color: #fff; margin-bottom: 5px; }
             .card .sub { font-size: 0.8em; color: #a1a1aa; }
             
-            .table-wrapper { background: #1e1e1e; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); overflow-x: auto; border: 1px solid #333; }
+            .table-wrapper { background: #1e1e1e; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); overflow-x: auto; border: 1px solid #333; margin-bottom: 30px;}
             table { width: 100%; border-collapse: collapse; min-width: 900px; }
             th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #333; }
             th { background-color: #2c2c2c; color: #ffffff; font-weight: 600; font-size: 0.95em; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -217,15 +217,30 @@ def view_logs():
             .bg-red { background: rgba(248, 113, 113, 0.2); color: #f87171; }
             
             .flex-col { display: flex; flex-direction: column; gap: 5px; }
-            .tag { background: #333; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; color: #ccc; }
+            .tag { background: #333; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; color: #ccc; border: 1px solid #444;}
+            
+            .btn { background: #3b82f6; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 0.9em; transition: 0.2s; }
+            .btn:hover { background: #2563eb; }
+            
+            .usage-table th { background-color: #1f2937; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🚀 WAPI Live Dashboard</h1>
+            <h1>
+                🚀 WAPI Live Dashboard
+                <button class="btn" onclick="fetchData()" id="refresh-btn">🔄 Refresh</button>
+            </h1>
             
+            <!-- Error message container -->
+            <div id="error-msg" style="color: #fca5a5; background: #451a1a; padding: 10px; border-radius: 5px; text-align: center; display: none; margin-bottom: 15px;"></div>
+
             <div class="status-panel" id="status-panel">
-                <!-- Filled by JS -->
+                <div class="card" style="text-align:center; padding: 30px;">Loading dashboard metrics...</div>
+            </div>
+            
+            <div class="status-panel" id="usage-panel">
+                <!-- Usage by key will go here -->
             </div>
             
             <h2 style="font-size: 1.2em; color: #ccc; border-bottom: 1px solid #333; padding-bottom: 10px;">🔐 Secure Access Logs</h2>
@@ -242,7 +257,7 @@ def view_logs():
                         </tr>
                     </thead>
                     <tbody id="logs-body">
-                        <tr><td colspan="6" style="text-align: center; color: #666; padding: 30px;">Loading data...</td></tr>
+                        <tr><td colspan="6" style="text-align: center; color: #666; padding: 30px;">Loading logs...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -251,33 +266,48 @@ def view_logs():
         <script>
             let isSelecting = false;
             
-            // Don't update DOM if user is selecting text to copy
             document.addEventListener('selectionchange', () => {
                 const selection = window.getSelection();
                 isSelecting = selection.toString().length > 0;
             });
 
             async function fetchData() {
+                const refreshBtn = document.getElementById('refresh-btn');
+                refreshBtn.innerText = "⏳...";
+                
                 try {
-                    const response = await fetch('/api/dashboard_data');
+                    // Added credentials include so basic auth works properly for fetch!
+                    const response = await fetch('/api/dashboard_data', { credentials: 'same-origin' });
+                    
+                    if (!response.ok) {
+                        throw new Error("HTTP " + response.status);
+                    }
+                    
                     const data = await response.json();
+                    
+                    document.getElementById('error-msg').style.display = 'none';
                     
                     if (!isSelecting) {
                         updateUI(data);
                     }
                 } catch (error) {
                     console.error("Error fetching data:", error);
+                    const errMsg = document.getElementById('error-msg');
+                    errMsg.style.display = 'block';
+                    errMsg.innerText = "⚠️ Could not load data. " + error.message;
                 }
+                
+                refreshBtn.innerText = "🔄 Refresh";
             }
 
             function updateUI(data) {
-                // Update Status Panel
                 const metrics = data.metrics;
                 
+                // --- 1. Top Cards ---
                 let penalizedHtml = '';
                 if (Object.keys(data.penalized_keys).length > 0) {
                     for (const [k, v] of Object.entries(data.penalized_keys)) {
-                        penalizedHtml += `<span class="tag" style="background: rgba(248,113,113,0.2); color: #f87171;">${k} (${v}m)</span>`;
+                        penalizedHtml += `<span class="tag" style="background: rgba(248,113,113,0.2); color: #f87171; border-color: #f87171;">${k} (${v}m)</span>`;
                     }
                 } else {
                     penalizedHtml = `<span style="color: #4ade80;">All Clear</span>`;
@@ -300,12 +330,12 @@ def view_logs():
                         <div class="sub">Total Requests</div>
                     </div>
                     <div class="card">
-                        <h3>Google API Calls</h3>
+                        <h3>Google API</h3>
                         <div class="val" style="color: #4ade80;">${metrics.successful_api_calls}</div>
-                        <div class="sub">Rate Limits Hit: <span style="color:#f87171">${metrics.rate_limit_hits}</span></div>
+                        <div class="sub">Limits Hit: <span style="color:#f87171">${metrics.rate_limit_hits}</span></div>
                     </div>
                     <div class="card">
-                        <h3>Fallback Triggered</h3>
+                        <h3>Fallback</h3>
                         <div class="val" style="color: #fbbf24;">${metrics.fallback_calls}</div>
                         <div class="sub">Failed Requests: <span style="color:#f87171">${metrics.failed_requests}</span></div>
                     </div>
@@ -317,7 +347,45 @@ def view_logs():
                     </div>
                 `;
 
-                // Update Logs Table
+                // --- 2. Key Usage Table ---
+                const usageKeys = Object.keys(metrics.usage_by_key || {});
+                if (usageKeys.length > 0) {
+                    let usageHtml = `
+                    <div class="card" style="flex: 100%;">
+                        <h3>🔑 API Key Usage Stats</h3>
+                        <div class="table-wrapper" style="margin-bottom: 0;">
+                            <table class="usage-table">
+                                <thead>
+                                    <tr>
+                                        <th>Key (Prefix)</th>
+                                        <th>Model</th>
+                                        <th>Successful Calls</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                    `;
+                    
+                    for (const keyPrefix of usageKeys) {
+                        const modelsUsed = metrics.usage_by_key[keyPrefix];
+                        for (const [modName, count] of Object.entries(modelsUsed)) {
+                            usageHtml += `
+                                <tr>
+                                    <td style="font-family: monospace; color: #93c5fd;">${escapeHtml(keyPrefix)}</td>
+                                    <td><span class="tag">${escapeHtml(modName)}</span></td>
+                                    <td style="color: #4ade80; font-weight: bold;">${count}</td>
+                                </tr>
+                            `;
+                        }
+                    }
+                    
+                    usageHtml += `</tbody></table></div></div>`;
+                    document.getElementById('usage-panel').innerHTML = usageHtml;
+                    document.getElementById('usage-panel').style.display = 'flex';
+                } else {
+                    document.getElementById('usage-panel').style.display = 'none';
+                }
+
+                // --- 3. Logs Table ---
                 const tbody = document.getElementById('logs-body');
                 if (data.logs.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #666; padding: 30px;">No requests logged yet.</td></tr>';
@@ -334,8 +402,8 @@ def view_logs():
                         <tr>
                             <td style="white-space: nowrap; color: #888; font-size: 0.9em;">${log.time || ''}</td>
                             <td class="ip">${log.ip || ''}</td>
-                            <td><span class="${pwdClass}">${pwdText}</span></td>
-                            <td><span class="badge ${badgeClass}">${log.status || ''}</span></td>
+                            <td><span class="${pwdClass}">${escapeHtml(pwdText)}</span></td>
+                            <td><span class="badge ${badgeClass}">${escapeHtml(log.status || '')}</span></td>
                             <td><div class="msg">${escapeHtml(log.message || 'No message')}</div></td>
                             <td><div class="msg" style="max-height: 150px; overflow-y: auto; max-width: 300px;">${escapeHtml(log.params || 'No parameters')}</div></td>
                         </tr>
@@ -363,7 +431,6 @@ def view_logs():
     </html>
     """
     return render_template_string(html)
-
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 def proxy_chat():
     if request.method == 'OPTIONS':
