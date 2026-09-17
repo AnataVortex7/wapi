@@ -64,9 +64,9 @@ def get_next_available_combo():
                 current_model_idx = 0
                 current_key_idx = (current_key_idx + 1) % len(API_KEYS)
             
-            # Check 24-hour penalty (86400 seconds)
+            # Check variable penalty
             if key in key_penalties:
-                if now - key_penalties[key] < 86400:
+                if now < key_penalties[key]:
                     continue
                 else:
                     del key_penalties[key]
@@ -264,10 +264,15 @@ def proxy_chat():
     original_auth = request.headers.get("Authorization", "")
     
     # Try Real APIs
-    while True:
+    max_retries = len(API_KEYS) * len(MODELS) if API_KEYS and MODELS else 0
+    attempts = 0
+    
+    while attempts < max_retries:
         key, model_name = get_next_available_combo()
         if not key:
             break
+            
+        attempts += 1
             
         data["model"] = model_name
         headers = {
@@ -293,10 +298,17 @@ def proxy_chat():
                                if name.lower() not in excluded_headers]
                 return Response(resp.content, resp.status_code, out_headers)
             elif resp.status_code in [429, 403]:
+                error_text = resp.text.lower()
+                if "quota" in error_text or "daily" in error_text or "exhausted" in error_text:
+                    penalty_duration = 86400  # 24 hours
+                    print(f"Key {key[:5]}... hit DAILY LIMIT. Penalized for 24h.")
+                else:
+                    penalty_duration = 120    # 2 minutes
+                    print(f"Key {key[:5]}... hit RPM/403. Penalized for 2m.")
+                    
                 with state_lock:
-                    key_penalties[key] = time.time()
+                    key_penalties[key] = time.time() + penalty_duration
                     metrics["rate_limit_hits"] += 1
-                print(f"Key {key[:5]}... hit 429/403. Penalized for 24h.")
                 continue
             elif resp.status_code in [500, 503]:
                 print(f"Model {model_name} overloaded (500/503). Trying next combo...")
@@ -358,11 +370,11 @@ def add_key_model():
 @app.route('/status', methods=['GET'])
 def get_status():
     now = time.time()
-    penalized = {k[:5]+"...": round((86400 - (now - ts))/3600, 1) for k, ts in key_penalties.items()}
+    penalized = {k[:5]+"...": round((ts - now)/60, 1) for k, ts in key_penalties.items()} # minutes left
     return jsonify({
         "metrics": metrics,
         "active_keys": len(API_KEYS),
-        "penalized_keys_hours_left": penalized,
+        "penalized_keys_minutes_left": penalized,
         "models": MODELS
     })
 
