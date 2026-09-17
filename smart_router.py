@@ -172,7 +172,7 @@ def update_log_status(response):
 @requires_browser_auth
 def api_dashboard_data():
     now = time.time()
-    penalized = {k[:5]+"...": round((ts - now)/60, 1) for k, ts in key_penalties.items()}
+    penalized = {k[:5]+"..."+k[-5:]: round((ts - now)/60, 1) for k, ts in key_penalties.items()}
     
     return jsonify({
         "metrics": metrics,
@@ -475,7 +475,7 @@ def proxy_chat():
             if resp.status_code == 200:
                 with state_lock:
                     metrics["successful_api_calls"] += 1
-                    safe_key = key[:5] + "..."
+                    safe_key = key[:5] + "..." + key[-5:]
                     if safe_key not in metrics["usage_by_key"]:
                         metrics["usage_by_key"][safe_key] = {}
                     if model_name not in metrics["usage_by_key"][safe_key]:
@@ -490,10 +490,10 @@ def proxy_chat():
                 error_text = resp.text.lower()
                 if "quota" in error_text or "daily" in error_text or "exhausted" in error_text:
                     penalty_duration = 86400  # 24 hours
-                    print(f"Key {key[:5]}... hit DAILY LIMIT. Penalized for 24h.")
+                    print(f"Key {key[:5]}...{key[-5:]} hit DAILY LIMIT. Penalized for 24h.")
                 else:
                     penalty_duration = 120    # 2 minutes
-                    print(f"Key {key[:5]}... hit RPM/403. Penalized for 2m.")
+                    print(f"Key {key[:5]}...{key[-5:]} hit RPM/403. Penalized for 2m.")
                     
                 with state_lock:
                     key_penalties[key] = time.time() + penalty_duration
@@ -559,7 +559,7 @@ def add_key_model():
 @app.route('/status', methods=['GET'])
 def get_status():
     now = time.time()
-    penalized = {k[:5]+"...": round((ts - now)/60, 1) for k, ts in key_penalties.items()} # minutes left
+    penalized = {k[:5]+"..."+k[-5:]: round((ts - now)/60, 1) for k, ts in key_penalties.items()} # minutes left
     return jsonify({
         "metrics": metrics,
         "active_keys": len(API_KEYS),
