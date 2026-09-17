@@ -17,11 +17,12 @@ for m in RAW_MODELS:
     if not m.strip(): continue
     parts = m.split(":")
     name = parts[0].strip()
-    rpm = int(parts[1].strip()) if len(parts) > 1 else 5
-    MODELS.append({"name": name, "rpm": rpm})
+    rpm = int(parts[1].strip()) if len(parts) > 1 else 15
+    rpd = int(parts[2].strip()) if len(parts) > 2 else (1500 if "flash" in name else 50)
+    MODELS.append({"name": name, "rpm": rpm, "rpd": rpd})
 
 if not MODELS:
-    MODELS = [{"name": "gemini-1.5-flash", "rpm": 15}]
+    MODELS = [{"name": "gemini-1.5-flash", "rpm": 15, "rpd": 1500}]
 
 # State tracking
 key_penalties = {}  # key -> timestamp when it was banned
@@ -315,7 +316,45 @@ def view_logs():
 
                 let modelsHtml = '';
                 data.models.forEach(m => {
-                    modelsHtml += `<span class="tag">${m.name} (${m.rpm}rpm)</span>`;
+                    // Calculate totals for this model
+                    let totalUsed = 0;
+                    let keysHtml = '';
+                    
+                    const usageKeys = Object.keys(metrics.usage_by_key || {});
+                    usageKeys.forEach(keyPrefix => {
+                        const count = metrics.usage_by_key[keyPrefix][m.name] || 0;
+                        if(count > 0) {
+                            totalUsed += count;
+                            let remaining = m.rpd - count;
+                            if(remaining < 0) remaining = 0;
+                            
+                            let color = remaining > 100 ? '#4ade80' : (remaining > 10 ? '#fbbf24' : '#f87171');
+                            
+                            keysHtml += `
+                                <div style="display:flex; justify-content:space-between; font-size:0.85em; padding:3px 0; border-bottom:1px solid #333;">
+                                    <span style="font-family:monospace; color:#93c5fd;">${keyPrefix}</span>
+                                    <span>Used: <strong style="color:#fff;">${count}</strong> | Rem: <strong style="color:${color};">${remaining}</strong></span>
+                                </div>
+                            `;
+                        }
+                    });
+                    
+                    if(keysHtml === '') {
+                        keysHtml = '<div style="font-size:0.85em; color:#666; padding:5px 0;">No usage yet.</div>';
+                    }
+
+                    modelsHtml += `
+                        <div class="model-box" style="background:#252526; border:1px solid #444; border-radius:6px; margin-bottom:10px; overflow:hidden;">
+                            <div class="model-header" onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none'" style="cursor:pointer; padding:8px 12px; display:flex; justify-content:space-between; align-items:center; background:#2d2d30;">
+                                <strong style="color:#e0e0e0; font-size:0.95em;">${m.name}</strong>
+                                <span style="font-size:0.8em; color:#aaa; background:#1e1e1e; padding:2px 6px; border-radius:4px;">${m.rpm} RPM | ${m.rpd} RPD</span>
+                            </div>
+                            <div class="model-details" style="display:none; padding:10px; background:#1e1e1e;">
+                                <div style="font-size:0.85em; color:#888; margin-bottom:5px;">Session Usage by Key:</div>
+                                ${keysHtml}
+                            </div>
+                        </div>
+                    `;
                 });
 
                 document.getElementById('status-panel').innerHTML = `
@@ -340,50 +379,14 @@ def view_logs():
                         <div class="sub">Failed Requests: <span style="color:#f87171">${metrics.failed_requests}</span></div>
                     </div>
                     <div class="card" style="flex: 2;">
-                        <h3>Active Models</h3>
-                        <div class="flex-col" style="flex-direction: row; flex-wrap: wrap; gap: 5px;">
+                        <h3>🤖 Active Models (Click to view Key usage & RPD)</h3>
+                        <div class="flex-col">
                             ${modelsHtml}
                         </div>
                     </div>
                 `;
 
-                // --- 2. Key Usage Table ---
-                const usageKeys = Object.keys(metrics.usage_by_key || {});
-                if (usageKeys.length > 0) {
-                    let usageHtml = `
-                    <div class="card" style="flex: 100%;">
-                        <h3>🔑 API Key Usage Stats</h3>
-                        <div class="table-wrapper" style="margin-bottom: 0;">
-                            <table class="usage-table">
-                                <thead>
-                                    <tr>
-                                        <th>Key (Prefix)</th>
-                                        <th>Model</th>
-                                        <th>Successful Calls</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                    `;
-                    
-                    for (const keyPrefix of usageKeys) {
-                        const modelsUsed = metrics.usage_by_key[keyPrefix];
-                        for (const [modName, count] of Object.entries(modelsUsed)) {
-                            usageHtml += `
-                                <tr>
-                                    <td style="font-family: monospace; color: #93c5fd;">${escapeHtml(keyPrefix)}</td>
-                                    <td><span class="tag">${escapeHtml(modName)}</span></td>
-                                    <td style="color: #4ade80; font-weight: bold;">${count}</td>
-                                </tr>
-                            `;
-                        }
-                    }
-                    
-                    usageHtml += `</tbody></table></div></div>`;
-                    document.getElementById('usage-panel').innerHTML = usageHtml;
-                    document.getElementById('usage-panel').style.display = 'flex';
-                } else {
-                    document.getElementById('usage-panel').style.display = 'none';
-                }
+
 
                 // --- 3. Logs Table ---
                 const tbody = document.getElementById('logs-body');
