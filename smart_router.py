@@ -167,83 +167,202 @@ def update_log_status(response):
                 g.log_entry["status"] = f"{response.status_code} Failed"
     return response
 
+@app.route('/api/dashboard_data', methods=['GET'])
+@requires_browser_auth
+def api_dashboard_data():
+    now = time.time()
+    penalized = {k[:5]+"...": round((ts - now)/60, 1) for k, ts in key_penalties.items()}
+    
+    return jsonify({
+        "metrics": metrics,
+        "active_keys": len(API_KEYS),
+        "penalized_keys": penalized,
+        "models": MODELS,
+        "logs": list(request_logs)
+    })
+
 @app.route('/logs', methods=['GET'])
 @requires_browser_auth
-def view_secure_logs():
-    html = '''
+def view_logs():
+    html = """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Secure API Logs</title>
+        <title>WAPI Dashboard</title>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <meta http-equiv="refresh" content="5">
         <style>
             body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #121212; color: #e0e0e0; }
             .container { max-width: 1400px; margin: 0 auto; }
-            h1 { color: #ffffff; text-align: center; margin-bottom: 30px; text-shadow: 0 0 10px rgba(255,255,255,0.2); }
+            h1 { color: #ffffff; text-align: center; margin-bottom: 20px; text-shadow: 0 0 10px rgba(255,255,255,0.2); }
+            
+            /* Status Panel */
+            .status-panel { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 25px; }
+            .card { background: #1e1e1e; border-radius: 8px; padding: 15px; flex: 1; min-width: 200px; border: 1px solid #333; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }
+            .card h3 { margin: 0 0 10px 0; font-size: 0.9em; color: #888; text-transform: uppercase; letter-spacing: 1px; }
+            .card .val { font-size: 1.8em; font-weight: bold; color: #fff; margin-bottom: 5px; }
+            .card .sub { font-size: 0.8em; color: #a1a1aa; }
+            
             .table-wrapper { background: #1e1e1e; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); overflow-x: auto; border: 1px solid #333; }
             table { width: 100%; border-collapse: collapse; min-width: 900px; }
             th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #333; }
             th { background-color: #2c2c2c; color: #ffffff; font-weight: 600; font-size: 0.95em; text-transform: uppercase; letter-spacing: 0.5px; }
             tr:hover { background-color: #252525; }
-            .status-correct { color: #4ade80; font-weight: bold; }
-            .status-wrong { color: #f87171; font-weight: bold; }
-            .msg { max-width: 400px; white-space: pre-wrap; word-break: break-word; font-size: 0.9em; color: #a1a1aa; background: #18181b; padding: 8px; border-radius: 4px; }
+            
+            .msg { max-width: 400px; white-space: pre-wrap; word-break: break-word; font-size: 0.9em; color: #ce9178; background: #18181b; padding: 8px; border-radius: 4px; font-family: monospace; }
             .pwd-wrong { font-family: monospace; color: #fca5a5; background: #451a1a; padding: 3px 6px; border-radius: 3px; font-size: 0.9em; }
-            .pwd-correct { font-family: monospace; color: #4ade80; font-style: italic; font-size: 0.9em; }
+            .pwd-correct { font-family: monospace; color: #4ade80; font-style: italic; font-size: 0.9em; font-weight: bold; }
             .ip { font-family: monospace; color: #93c5fd; }
             .badge { padding: 4px 8px; border-radius: 4px; font-size: 0.85em; font-weight: bold; }
             .bg-green { background: rgba(74, 222, 128, 0.2); color: #4ade80; }
             .bg-red { background: rgba(248, 113, 113, 0.2); color: #f87171; }
+            
+            .flex-col { display: flex; flex-direction: column; gap: 5px; }
+            .tag { background: #333; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; color: #ccc; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🔐 Secure API Access Logs</h1>
-            <p style="text-align: center; color: #888;">Showing up to last 200 requests.</p>
+            <h1>🚀 WAPI Live Dashboard</h1>
+            
+            <div class="status-panel" id="status-panel">
+                <!-- Filled by JS -->
+            </div>
+            
+            <h2 style="font-size: 1.2em; color: #ccc; border-bottom: 1px solid #333; padding-bottom: 10px;">🔐 Secure Access Logs</h2>
             <div class="table-wrapper">
-                {% if logs %}
                 <table>
-                    <tr>
-                        <th>Time</th>
-                        <th>IP Address</th>
-                        <th>Attempted Password</th>
-                        <th>Status</th>
-                        <th>Message / Prompt</th>
-                        <th>Parameters</th>
-                    </tr>
-                    {% for log in logs %}
-                    <tr>
-                        <td style="white-space: nowrap; color: #888; font-size: 0.9em;">{{ log.time }}</td>
-                        <td class="ip">{{ log.ip }}</td>
-                        <td>
-                            {% if log.is_correct %}
-                                <span class="pwd-correct">🛡️ {{ log.password_used }}</span>
-                            {% else %}
-                                <span class="pwd-wrong">{{ log.password_used or "NONE" }}</span>
-                            {% endif %}
-                        </td>
-                        <td>
-                            {% if log.is_correct %}
-                                <span class="badge bg-green">{{ log.status }}</span>
-                            {% else %}
-                                <span class="badge bg-red">{{ log.status }}</span>
-                            {% endif %}
-                        </td>
-                        <td><div class="msg">{{ log.message or "No message" }}</div></td>
-                        <td><div class="msg" style="max-height: 150px; overflow-y: auto; max-width: 300px;">{{ log.params or "No parameters" }}</div></td>
-                    </tr>
-                    {% endfor %}
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>IP Address</th>
+                            <th>Attempted Password</th>
+                            <th>Status</th>
+                            <th>Message / Prompt</th>
+                            <th>Parameters</th>
+                        </tr>
+                    </thead>
+                    <tbody id="logs-body">
+                        <tr><td colspan="6" style="text-align: center; color: #666; padding: 30px;">Loading data...</td></tr>
+                    </tbody>
                 </table>
-                {% else %}
-                <div style="text-align: center; padding: 50px; color: #666;">No requests logged yet.</div>
-                {% endif %}
             </div>
         </div>
+
+        <script>
+            let isSelecting = false;
+            
+            // Don't update DOM if user is selecting text to copy
+            document.addEventListener('selectionchange', () => {
+                const selection = window.getSelection();
+                isSelecting = selection.toString().length > 0;
+            });
+
+            async function fetchData() {
+                try {
+                    const response = await fetch('/api/dashboard_data');
+                    const data = await response.json();
+                    
+                    if (!isSelecting) {
+                        updateUI(data);
+                    }
+                } catch (error) {
+                    console.error("Error fetching data:", error);
+                }
+            }
+
+            function updateUI(data) {
+                // Update Status Panel
+                const metrics = data.metrics;
+                
+                let penalizedHtml = '';
+                if (Object.keys(data.penalized_keys).length > 0) {
+                    for (const [k, v] of Object.entries(data.penalized_keys)) {
+                        penalizedHtml += `<span class="tag" style="background: rgba(248,113,113,0.2); color: #f87171;">${k} (${v}m)</span>`;
+                    }
+                } else {
+                    penalizedHtml = `<span style="color: #4ade80;">All Clear</span>`;
+                }
+
+                let modelsHtml = '';
+                data.models.forEach(m => {
+                    modelsHtml += `<span class="tag">${m.name} (${m.rpm}rpm)</span>`;
+                });
+
+                document.getElementById('status-panel').innerHTML = `
+                    <div class="card">
+                        <h3>Active Keys</h3>
+                        <div class="val" style="color: #60a5fa;">${data.active_keys}</div>
+                        <div class="sub flex-col">Penalized: <div style="display:flex; flex-wrap:wrap; gap:5px; margin-top:5px;">${penalizedHtml}</div></div>
+                    </div>
+                    <div class="card">
+                        <h3>API Traffic</h3>
+                        <div class="val">${metrics.total_incoming_requests}</div>
+                        <div class="sub">Total Requests</div>
+                    </div>
+                    <div class="card">
+                        <h3>Google API Calls</h3>
+                        <div class="val" style="color: #4ade80;">${metrics.successful_api_calls}</div>
+                        <div class="sub">Rate Limits Hit: <span style="color:#f87171">${metrics.rate_limit_hits}</span></div>
+                    </div>
+                    <div class="card">
+                        <h3>Fallback Triggered</h3>
+                        <div class="val" style="color: #fbbf24;">${metrics.fallback_calls}</div>
+                        <div class="sub">Failed Requests: <span style="color:#f87171">${metrics.failed_requests}</span></div>
+                    </div>
+                    <div class="card" style="flex: 2;">
+                        <h3>Active Models</h3>
+                        <div class="flex-col" style="flex-direction: row; flex-wrap: wrap; gap: 5px;">
+                            ${modelsHtml}
+                        </div>
+                    </div>
+                `;
+
+                // Update Logs Table
+                const tbody = document.getElementById('logs-body');
+                if (data.logs.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #666; padding: 30px;">No requests logged yet.</td></tr>';
+                    return;
+                }
+
+                let html = '';
+                data.logs.forEach(log => {
+                    const pwdClass = log.is_correct ? 'pwd-correct' : 'pwd-wrong';
+                    const pwdText = log.is_correct ? '🛡️ ' + log.password_used : (log.password_used || 'NONE');
+                    const badgeClass = log.is_correct ? 'bg-green' : 'bg-red';
+                    
+                    html += `
+                        <tr>
+                            <td style="white-space: nowrap; color: #888; font-size: 0.9em;">${log.time || ''}</td>
+                            <td class="ip">${log.ip || ''}</td>
+                            <td><span class="${pwdClass}">${pwdText}</span></td>
+                            <td><span class="badge ${badgeClass}">${log.status || ''}</span></td>
+                            <td><div class="msg">${escapeHtml(log.message || 'No message')}</div></td>
+                            <td><div class="msg" style="max-height: 150px; overflow-y: auto; max-width: 300px;">${escapeHtml(log.params || 'No parameters')}</div></td>
+                        </tr>
+                    `;
+                });
+                tbody.innerHTML = html;
+            }
+
+            function escapeHtml(unsafe) {
+                return (unsafe || '').toString()
+                     .replace(/&/g, "&amp;")
+                     .replace(/</g, "&lt;")
+                     .replace(/>/g, "&gt;")
+                     .replace(/"/g, "&quot;")
+                     .replace(/'/g, "&#039;");
+            }
+
+            // Initial fetch
+            fetchData();
+            
+            // Poll every 5 seconds
+            setInterval(fetchData, 5000);
+        </script>
     </body>
     </html>
-    '''
-    return render_template_string(html, logs=list(request_logs))
+    """
+    return render_template_string(html)
 
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 def proxy_chat():
