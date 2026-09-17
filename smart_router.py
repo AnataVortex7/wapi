@@ -319,6 +319,8 @@ def view_logs():
                     // Calculate totals for this model
                     let totalUsed = 0;
                     let keysHtml = '';
+                    let exhaustedKeys = 0;
+                    let penalizedForThisModel = 0;
                     
                     const usageKeys = Object.keys(metrics.usage_by_key || {});
                     usageKeys.forEach(keyPrefix => {
@@ -328,11 +330,15 @@ def view_logs():
                             let remaining = m.rpd - count;
                             if(remaining < 0) remaining = 0;
                             
+                            if(remaining === 0) exhaustedKeys++;
+                            if(data.penalized_keys[keyPrefix]) penalizedForThisModel++;
+                            
                             let color = remaining > 100 ? '#4ade80' : (remaining > 10 ? '#fbbf24' : '#f87171');
+                            let penStatus = data.penalized_keys[keyPrefix] ? ` <span style="color:#f87171;font-weight:bold;">(Blocked)</span>` : '';
                             
                             keysHtml += `
                                 <div style="display:flex; justify-content:space-between; font-size:0.85em; padding:3px 0; border-bottom:1px solid #333;">
-                                    <span style="font-family:monospace; color:#93c5fd;">${keyPrefix}</span>
+                                    <span style="font-family:monospace; color:#93c5fd;">${keyPrefix}${penStatus}</span>
                                     <span>Used: <strong style="color:#fff;">${count}</strong> | Rem: <strong style="color:${color};">${remaining}</strong></span>
                                 </div>
                             `;
@@ -342,12 +348,25 @@ def view_logs():
                     if(keysHtml === '') {
                         keysHtml = '<div style="font-size:0.85em; color:#666; padding:5px 0;">No usage yet.</div>';
                     }
+                    
+                    let badgeHtml = '';
+                    if (exhaustedKeys > 0) {
+                        badgeHtml += `<span style="background:rgba(248,113,113,0.2); color:#f87171; padding:2px 6px; border-radius:4px; font-size:0.8em; margin-left:5px; font-weight:bold;">⚠️ Limit Reached</span>`;
+                    } else if (penalizedForThisModel > 0) {
+                        badgeHtml += `<span style="background:rgba(251,191,36,0.2); color:#fbbf24; padding:2px 6px; border-radius:4px; font-size:0.8em; margin-left:5px; font-weight:bold;">⚠️ Key Blocked</span>`;
+                    }
 
                     modelsHtml += `
                         <div class="model-box" style="background:#252526; border:1px solid #444; border-radius:6px; margin-bottom:10px; overflow:hidden;">
                             <div class="model-header" onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none'" style="cursor:pointer; padding:8px 12px; display:flex; justify-content:space-between; align-items:center; background:#2d2d30;">
-                                <strong style="color:#e0e0e0; font-size:0.95em;">${m.name}</strong>
-                                <span style="font-size:0.8em; color:#aaa; background:#1e1e1e; padding:2px 6px; border-radius:4px;">${m.rpm} RPM | ${m.rpd} RPD</span>
+                                <div>
+                                    <strong style="color:#e0e0e0; font-size:0.95em;">${m.name}</strong>
+                                    ${badgeHtml}
+                                </div>
+                                <div style="display:flex; gap:10px; align-items:center;">
+                                    <span style="color:#4ade80; font-size:0.85em; font-weight:bold;">Used: ${totalUsed}</span>
+                                    <span style="font-size:0.8em; color:#aaa; background:#1e1e1e; padding:2px 6px; border-radius:4px; border:1px solid #444;">${m.rpm} RPM | ${m.rpd} RPD</span>
+                                </div>
                             </div>
                             <div class="model-details" style="display:none; padding:10px; background:#1e1e1e;">
                                 <div style="font-size:0.85em; color:#888; margin-bottom:5px;">Session Usage by Key:</div>
