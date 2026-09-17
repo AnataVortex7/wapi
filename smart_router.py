@@ -83,7 +83,7 @@ def get_next_available_combo():
                 
         return None, None
 
-request_logs = deque(maxlen=150)
+request_logs = deque(maxlen=200)
 
 def check_browser_auth(username, password):
     expected_pass = os.environ.get("PASSWORD", "")
@@ -117,15 +117,27 @@ def strict_password_and_log():
     
     is_correct = (auth_header == f"Bearer {expected_pass}")
     
-    # Extract message
+    # Extract message and parameters
     msg = ""
+    params_str = ""
     if request.is_json:
         try:
             body = request.get_json(silent=True) or {}
+            params_str = json.dumps(body, indent=2)
             if "messages" in body and isinstance(body["messages"], list) and len(body["messages"]) > 0:
                 msg = body["messages"][-1].get("content", "")
-        except:
-            pass
+        except Exception as e:
+            params_str = str(e)
+            
+    if not params_str and request.args:
+        params_str = json.dumps(dict(request.args), indent=2)
+
+    if isinstance(msg, str) and len(msg) > 1:
+        formatted_msg = f"{msg[0]}...{msg[-1]}"
+    elif isinstance(msg, str) and len(msg) == 1:
+        formatted_msg = msg
+    else:
+        formatted_msg = str(msg) if msg else ""
 
     log_entry = {
         "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -133,7 +145,8 @@ def strict_password_and_log():
         "path": request.path,
         "password_used": "*** HIDDEN (CORRECT) ***" if is_correct else auth_header,
         "is_correct": is_correct,
-        "message": msg[:300] + "..." if len(msg) > 300 else msg,
+        "message": formatted_msg,
+        "params": params_str,
         "status": "Pending..."
     }
     
@@ -187,7 +200,7 @@ def view_secure_logs():
     <body>
         <div class="container">
             <h1>🔐 Secure API Access Logs</h1>
-            <p style="text-align: center; color: #888;">Showing up to last 150 requests.</p>
+            <p style="text-align: center; color: #888;">Showing up to last 200 requests.</p>
             <div class="table-wrapper">
                 {% if logs %}
                 <table>
@@ -197,6 +210,7 @@ def view_secure_logs():
                         <th>Attempted Password</th>
                         <th>Status</th>
                         <th>Message / Prompt</th>
+                        <th>Parameters</th>
                     </tr>
                     {% for log in logs %}
                     <tr>
@@ -217,6 +231,7 @@ def view_secure_logs():
                             {% endif %}
                         </td>
                         <td><div class="msg">{{ log.message or "No message" }}</div></td>
+                        <td><div class="msg" style="max-height: 150px; overflow-y: auto; max-width: 300px;">{{ log.params or "No parameters" }}</div></td>
                     </tr>
                     {% endfor %}
                 </table>
@@ -238,7 +253,14 @@ def proxy_chat():
     with state_lock:
         metrics["total_incoming_requests"] += 1
         
-    data = request.json
+    data = request.json or {}
+    
+    # Remove unsupported OpenAI parameters that cause Gemini to throw errors
+    unsupported_keys = ["presence_penalty", "frequency_penalty", "logit_bias", "logprobs", "top_logprobs", "user", "seed"]
+    for k in unsupported_keys:
+        if k in data:
+            del data[k]
+            
     original_auth = request.headers.get("Authorization", "")
     
     # Try Real APIs
