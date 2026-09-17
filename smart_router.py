@@ -109,7 +109,7 @@ def strict_password_and_log():
         return
         
     # Exclude system routes from API password check (Logs has its own browser auth)
-    if request.path in ['/ping', '/healthz', '/logs']:
+    if request.path in ['/ping', '/healthz', '/logs', '/dashboard_data']:
         return
         
     expected_pass = os.environ.get("PASSWORD", "")
@@ -167,7 +167,7 @@ def update_log_status(response):
                 g.log_entry["status"] = f"{response.status_code} Failed"
     return response
 
-@app.route('/api/dashboard_data', methods=['GET'])
+@app.route('/dashboard_data', methods=['GET'])
 @requires_browser_auth
 def api_dashboard_data():
     now = time.time()
@@ -277,7 +277,7 @@ def view_logs():
                 
                 try {
                     // Added credentials include so basic auth works properly for fetch!
-                    const response = await fetch('/api/dashboard_data', { credentials: 'same-origin' });
+                    const response = await fetch('/router/dashboard_data', { credentials: 'same-origin' });
                     
                     if (!response.ok) {
                         throw new Error("HTTP " + response.status);
