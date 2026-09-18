@@ -233,6 +233,7 @@ def view_logs():
             .btn:hover { background: #2563eb; }
             
             .usage-table th { background-color: #1f2937; }
+            .params-box { display: none; }
         </style>
     </head>
     <body>
@@ -253,7 +254,10 @@ def view_logs():
                 <!-- Usage by key will go here -->
             </div>
             
-            <h2 style="font-size: 1.2em; color: #ccc; border-bottom: 1px solid #333; padding-bottom: 10px;">🔐 Secure Access Logs</h2>
+            <h2 style="display:flex; justify-content:space-between; align-items:center; font-size: 1.2em; color: #ccc; border-bottom: 1px solid #333; padding-bottom: 10px;">
+                🔐 Secure Access Logs
+                <button class="btn" onclick="toggleAllParams()" id="toggle-btn">👁️ Show All Params</button>
+            </h2>
             <div class="table-wrapper">
                 <table>
                     <thead>
@@ -275,6 +279,21 @@ def view_logs():
 
         <script>
             let isSelecting = false;
+            let allParamsVisible = false;
+            
+            function toggleParams(idx) {
+                const el = document.getElementById('params-' + idx);
+                el.style.display = (el.style.display === 'none' || el.style.display === '') ? 'block' : 'none';
+            }
+            
+            function toggleAllParams() {
+                allParamsVisible = !allParamsVisible;
+                document.getElementById('toggle-btn').innerText = allParamsVisible ? '🙈 Hide All Params' : '👁️ Show All Params';
+                const boxes = document.getElementsByClassName('params-box');
+                for (let box of boxes) {
+                    box.style.display = allParamsVisible ? 'block' : 'none';
+                }
+            }
             
             document.addEventListener('selectionchange', () => {
                 const selection = window.getSelection();
@@ -286,7 +305,6 @@ def view_logs():
                 refreshBtn.innerText = "⏳...";
                 
                 try {
-                    // Added credentials include so basic auth works properly for fetch!
                     const response = await fetch('/router/dashboard_data', { credentials: 'same-origin' });
                     
                     if (!response.ok) {
@@ -325,7 +343,6 @@ def view_logs():
 
                 let modelsHtml = '';
                 data.models.forEach(m => {
-                    // Calculate totals for this model
                     let totalUsed = 0;
                     let keysHtml = '';
                     let exhaustedKeys = 0;
@@ -414,9 +431,6 @@ def view_logs():
                     </div>
                 `;
 
-
-
-                // --- 3. Logs Table ---
                 const tbody = document.getElementById('logs-body');
                 if (data.logs.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #666; padding: 30px;">No requests logged yet.</td></tr>';
@@ -424,7 +438,7 @@ def view_logs():
                 }
 
                 let html = '';
-                data.logs.forEach(log => {
+                data.logs.forEach((log, idx) => {
                     const pwdClass = log.is_correct ? 'pwd-correct' : 'pwd-wrong';
                     const pwdText = log.is_correct ? '🛡️ ' + log.password_used : (log.password_used || 'NONE');
                     const badgeClass = log.is_correct ? 'bg-green' : 'bg-red';
@@ -436,11 +450,23 @@ def view_logs():
                             <td><span class="${pwdClass}">${escapeHtml(pwdText)}</span></td>
                             <td><span class="badge ${badgeClass}">${escapeHtml(log.status || '')}</span></td>
                             <td><div class="msg">${escapeHtml(log.message || 'No message')}</div></td>
-                            <td><div class="msg" style="max-height: 150px; overflow-y: auto; max-width: 300px;">${escapeHtml(log.params || 'No parameters')}</div></td>
+                            <td>
+                                <button class="btn" style="padding: 2px 6px; font-size: 0.7em; margin-bottom: 5px;" onclick="toggleParams(${idx})">Show Params</button>
+                                <div id="params-${idx}" class="msg params-box" style="display: none; max-height: 150px; overflow-y: auto; max-width: 300px;">${escapeHtml(log.params || 'No parameters')}</div>
+                            </td>
                         </tr>
                     `;
                 });
                 tbody.innerHTML = html;
+            }
+
+            function toggleParams(idx) {
+                const el = document.getElementById('params-' + idx);
+                if (el.style.display === 'none') {
+                    el.style.display = 'block';
+                } else {
+                    el.style.display = 'none';
+                }
             }
 
             function escapeHtml(unsafe) {
@@ -452,10 +478,7 @@ def view_logs():
                      .replace(/'/g, "&#039;");
             }
 
-            // Initial fetch
             fetchData();
-            
-            // Poll every 5 seconds
             setInterval(fetchData, 5000);
         </script>
     </body>
@@ -478,11 +501,10 @@ def proxy_chat():
         if k in data:
             del data[k]
             
-    original_auth = request.headers.get("Authorization", "")
-    
-    # Try Real APIs
+    # Try Real APIs across all keys and models
     max_retries = len(API_KEYS) * len(MODELS) if API_KEYS and MODELS else 0
     attempts = 0
+    last_resp = None
     
     while attempts < max_retries:
         key, model_name = get_next_available_combo()
@@ -500,6 +522,8 @@ def proxy_chat():
         
         try:
             resp = requests.post(url, json=data, headers=headers, stream=True)
+            last_resp = resp
+            
             if resp.status_code == 200:
                 with state_lock:
                     metrics["successful_api_calls"] += 1
@@ -514,10 +538,22 @@ def proxy_chat():
                 out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
                                if name.lower() not in excluded_headers]
                 return Response(resp.content, resp.status_code, out_headers)
+                
             elif resp.status_code in [429, 403]:
                 error_text = resp.text.lower()
+                
+                # १. जर 403 (Safety/Permission Issue) असेल, तर इतर keys block करू नका. 
+                if resp.status_code == 403:
+                    print(f"Key {key[:5]}...{key[-5:]} hit 403 Forbidden. Stopping retries.")
+                    with state_lock:
+                        metrics["failed_requests"] += 1
+                    excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+                    out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
+                                   if name.lower() not in excluded_headers]
+                    return Response(resp.content, resp.status_code, out_headers)
+
                 if "quota" in error_text or "daily" in error_text or "exhausted" in error_text:
-                    # Calculate next midnight IST
+                    # Only block until midnight IST if daily quota is actually exhausted
                     now_utc = datetime.datetime.utcnow()
                     ist_offset = datetime.timedelta(hours=5, minutes=30)
                     now_ist = now_utc + ist_offset
@@ -526,45 +562,51 @@ def proxy_chat():
                     unlock_time = next_midnight_utc.timestamp()
                     print(f"Key {key[:5]}...{key[-5:]} hit DAILY LIMIT. Penalized until Midnight IST.")
                 else:
-                    unlock_time = time.time() + 120    # 2 minutes
+                    # Regular RPM limit or other 429/403 -> block for only 2 minutes
+                    unlock_time = time.time() + 120
                     print(f"Key {key[:5]}...{key[-5:]} hit RPM/403. Penalized for 2m.")
                     
                 with state_lock:
                     key_penalties[key] = unlock_time
                     metrics["rate_limit_hits"] += 1
+                    
+                # जर एकाच request ने 429 error दिला, तर लगेच थांबवा (इतर keys वर ट्राय नको)
+                if attempts >= 1:
+                    print("429 error received. Stopping retries to save other keys.")
+                    excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+                    out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
+                                   if name.lower() not in excluded_headers]
+                    return Response(resp.content, resp.status_code, out_headers)
+                    
                 continue
+                
             elif resp.status_code in [500, 503]:
-                print(f"Model {model_name} overloaded (500/503). Trying next combo...")
+                # Overload/500/503: Do NOT penalize or block keys. Try next combo.
+                print(f"Model {model_name} overloaded (500/503). Trying next combo without blocking key...")
                 continue
             else:
+                # Other non-200 responses
                 with state_lock:
                     metrics["failed_requests"] += 1
-                return Response(resp.content, resp.status_code)
+                excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+                out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
+                               if name.lower() not in excluded_headers]
+                return Response(resp.content, resp.status_code, out_headers)
+                
         except Exception as e:
             print(f"API call error: {e}")
             continue
             
-    # FALLBACK to Web2API
-    print("Falling back to Web2API on port 8081...")
-    with state_lock:
-        metrics["fallback_calls"] += 1
-        
-    fallback_url = "http://127.0.0.1:8081/v1/chat/completions"
-    
-    # Forward all original headers transparently (except host)
-    fallback_headers = {k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']}
-    
-        
-    try:
-        resp = requests.post(fallback_url, json=data, headers=fallback_headers)
-        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
-                       if name.lower() not in excluded_headers]
-        return Response(resp.content, resp.status_code, out_headers)
-    except Exception as e:
+    # If all API key and model combos failed (e.g. all returned 500 or overload), return last response instead of blocking/failing wrongly
+    if last_resp is not None:
         with state_lock:
             metrics["failed_requests"] += 1
-        return jsonify({"error": {"message": "All APIs failed and Fallback is down.", "type": "server_error"}}), 500
+        excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+        out_headers = [(name, value) for (name, value) in last_resp.raw.headers.items()
+                       if name.lower() not in excluded_headers]
+        return Response(last_resp.content, last_resp.status_code, out_headers)
+        
+    return jsonify({"error": {"message": "All API keys and models failed.", "type": "server_error"}}), 500
 
 @app.route('/v1/models', methods=['GET', 'OPTIONS'])
 def proxy_models():
