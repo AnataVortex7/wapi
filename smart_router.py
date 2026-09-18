@@ -61,6 +61,10 @@ def get_next_available_combo():
         
         total_combos = len(API_KEYS) * len(MODELS)
         for _ in range(total_combos):
+            # Dynamic bounds safety check
+            current_key_idx = current_key_idx % len(API_KEYS)
+            current_model_idx = current_model_idx % len(MODELS)
+            
             key = API_KEYS[current_key_idx]
             model = MODELS[current_model_idx]
             
@@ -492,7 +496,7 @@ def proxy_chat():
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json"
         }
-                url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         
         try:
             resp = requests.post(url, json=data, headers=headers, stream=True)
@@ -552,7 +556,7 @@ def proxy_chat():
     
         
     try:
-        resp = requests.post(fallback_url, json=request.json, headers=fallback_headers)
+        resp = requests.post(fallback_url, json=data, headers=fallback_headers)
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
         out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
                        if name.lower() not in excluded_headers]
