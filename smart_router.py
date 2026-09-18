@@ -84,7 +84,7 @@ def get_next_available_combo():
                 
         return None, None
 
-request_logs = deque(maxlen=200)
+request_logs = deque(maxlen=150)
 
 def check_browser_auth(username, password):
     expected_pass = os.environ.get("PASSWORD", "")
