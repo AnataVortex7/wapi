@@ -11,23 +11,24 @@ def get_spoofed_headers(api_key):
     # Create a stable fingerprint based on the API key
     h = hashlib.md5(api_key.encode()).hexdigest()
     
+    # Use Developer/API User-Agents to look perfectly legitimate
     user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/115.0",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/118.0.0.0 Chrome/118.0.0.0 Safari/537.36",
         "python-requests/2.31.0",
+        "google-api-python-client/2.118.0",
+        "axios/1.6.2",
+        "node-fetch/2.6.7",
+        "Go-http-client/1.1",
         "PostmanRuntime/7.36.1",
-        "axios/1.6.2"
+        "curl/8.4.0",
+        "Java/11.0.12"
     ]
     
     # Pick a stable User-Agent
     idx = int(h[:4], 16) % len(user_agents)
     ua = user_agents[idx]
     
-    # Generate a stable IP address (e.g. 104.X.Y.Z or 172.X.Y.Z)
-    prefix = [104, 172, 192, 203][int(h[4:5], 16) % 4]
+    # Generate a stable datacenter IP address (e.g. AWS/GCP ranges)
+    prefix = [35, 104, 34, 18][int(h[4:5], 16) % 4]
     ip_p2 = int(h[5:7], 16)
     ip_p3 = int(h[7:9], 16)
     ip_p4 = int(h[9:11], 16) % 254 + 1
@@ -36,8 +37,7 @@ def get_spoofed_headers(api_key):
     return {
         "User-Agent": ua,
         "X-Forwarded-For": spoofed_ip,
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Ch-Ua-Platform": '"Windows"' if 'Windows' in ua else ('"macOS"' if 'Mac' in ua else '"Linux"')
+        "Accept": "application/json"
     }
 
 
@@ -545,14 +545,20 @@ def proxy_chat():
             elif resp.status_code in [429, 403]:
                 error_text = resp.text.lower()
                 if "quota" in error_text or "daily" in error_text or "exhausted" in error_text:
-                    penalty_duration = 86400  # 24 hours
-                    print(f"Key {key[:5]}...{key[-5:]} hit DAILY LIMIT. Penalized for 24h.")
+                    # Calculate next midnight IST
+                    now_utc = datetime.datetime.utcnow()
+                    ist_offset = datetime.timedelta(hours=5, minutes=30)
+                    now_ist = now_utc + ist_offset
+                    next_midnight_ist = datetime.datetime(now_ist.year, now_ist.month, now_ist.day) + datetime.timedelta(days=1)
+                    next_midnight_utc = next_midnight_ist - ist_offset
+                    unlock_time = next_midnight_utc.timestamp()
+                    print(f"Key {key[:5]}...{key[-5:]} hit DAILY LIMIT. Penalized until Midnight IST.")
                 else:
-                    penalty_duration = 120    # 2 minutes
+                    unlock_time = time.time() + 120    # 2 minutes
                     print(f"Key {key[:5]}...{key[-5:]} hit RPM/403. Penalized for 2m.")
                     
                 with state_lock:
-                    key_penalties[key] = time.time() + penalty_duration
+                    key_penalties[key] = unlock_time
                     metrics["rate_limit_hits"] += 1
                 continue
             elif resp.status_code in [500, 503]:
