@@ -5,13 +5,49 @@ from functools import wraps
 from collections import deque
 import requests
 
+import hashlib
+
+def get_spoofed_headers(api_key):
+    # Create a stable fingerprint based on the API key
+    h = hashlib.md5(api_key.encode()).hexdigest()
+    
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/115.0",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Ubuntu Chromium/118.0.0.0 Chrome/118.0.0.0 Safari/537.36",
+        "python-requests/2.31.0",
+        "PostmanRuntime/7.36.1",
+        "axios/1.6.2"
+    ]
+    
+    # Pick a stable User-Agent
+    idx = int(h[:4], 16) % len(user_agents)
+    ua = user_agents[idx]
+    
+    # Generate a stable IP address (e.g. 104.X.Y.Z or 172.X.Y.Z)
+    prefix = [104, 172, 192, 203][int(h[4:5], 16) % 4]
+    ip_p2 = int(h[5:7], 16)
+    ip_p3 = int(h[7:9], 16)
+    ip_p4 = int(h[9:11], 16) % 254 + 1
+    spoofed_ip = f"{prefix}.{ip_p2}.{ip_p3}.{ip_p4}"
+    
+    return {
+        "User-Agent": ua,
+        "X-Forwarded-For": spoofed_ip,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Ch-Ua-Platform": '"Windows"' if 'Windows' in ua else ('"macOS"' if 'Mac' in ua else '"Linux"')
+    }
+
+
 app = Flask(__name__)
 
 # Config loaded from Environment
 RAW_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
 RAW_MODELS = os.environ.get("GEMINI_MODELS", "gemini-1.5-flash:15,gemini-1.5-pro:2").split(",")
 
-API_KEYS = [k.strip() for k in RAW_KEYS if k.strip()]
+API_KEYS = list(dict.fromkeys([k.strip() for k in RAW_KEYS if k.strip()]))
 MODELS = []
 for m in RAW_MODELS:
     if not m.strip(): continue
@@ -487,6 +523,7 @@ def proxy_chat():
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json"
         }
+        headers.update(get_spoofed_headers(key))
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         
         try:
