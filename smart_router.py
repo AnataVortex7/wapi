@@ -7,38 +7,7 @@ import requests
 
 import hashlib
 
-def get_spoofed_headers(api_key):
-    # Create a stable fingerprint based on the API key
-    h = hashlib.md5(api_key.encode()).hexdigest()
-    
-    # Use Developer/API User-Agents to look perfectly legitimate
-    user_agents = [
-        "python-requests/2.31.0",
-        "google-api-python-client/2.118.0",
-        "axios/1.6.2",
-        "node-fetch/2.6.7",
-        "Go-http-client/1.1",
-        "PostmanRuntime/7.36.1",
-        "curl/8.4.0",
-        "Java/11.0.12"
-    ]
-    
-    # Pick a stable User-Agent
-    idx = int(h[:4], 16) % len(user_agents)
-    ua = user_agents[idx]
-    
-    # Generate a stable datacenter IP address (e.g. AWS/GCP ranges)
-    prefix = [35, 104, 34, 18][int(h[4:5], 16) % 4]
-    ip_p2 = int(h[5:7], 16)
-    ip_p3 = int(h[7:9], 16)
-    ip_p4 = int(h[9:11], 16) % 254 + 1
-    spoofed_ip = f"{prefix}.{ip_p2}.{ip_p3}.{ip_p4}"
-    
-    return {
-        "User-Agent": ua,
-        "X-Forwarded-For": spoofed_ip,
-        "Accept": "application/json"
-    }
+
 
 
 app = Flask(__name__)
@@ -523,8 +492,7 @@ def proxy_chat():
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json"
         }
-        headers.update(get_spoofed_headers(key))
-        url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+                url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         
         try:
             resp = requests.post(url, json=data, headers=headers, stream=True)
