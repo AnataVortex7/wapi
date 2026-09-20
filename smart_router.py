@@ -6,11 +6,7 @@ from collections import deque
 import requests
 import base64
 import urllib.parse
-
 import hashlib
-
-
-
 
 app = Flask(__name__)
 
@@ -19,6 +15,7 @@ RAW_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
 RAW_MODELS = os.environ.get("GEMINI_MODELS", "gemini-1.5-flash:15,gemini-1.5-pro:2").split(",")
 
 API_KEYS = list(dict.fromkeys([k.strip() for k in RAW_KEYS if k.strip()]))
+
 MODELS = []
 for m in RAW_MODELS:
     if not m.strip(): continue
@@ -32,7 +29,11 @@ if not MODELS:
     MODELS = [{"name": "gemini-1.5-flash", "rpm": 15, "rpd": 1500}]
 
 # State tracking
-key_penalties = {}  # key -> timestamp when it was banned
+# FIX: key_penalties is now keyed by (key, model_name) instead of just key.
+# Previously, hitting a daily limit on ONE model would block that API key
+# for ALL models until midnight, even models that still had plenty of quota.
+# That was the root cause of the premature "All keys rate-limited" error.
+key_penalties = {}  # (key, model_name) -> timestamp when it was banned
 request_history = {} # (key, model) -> list of timestamps
 
 # Global Metrics
@@ -70,23 +71,20 @@ def refresh_models_loop():
                                 rpm = 1500 if "flash" in name.lower() else 15
                                 rpd = 1500 if "flash" in name.lower() else 50
                                 new_rr.append({"name": name, "rpm": rpm, "rpd": rpd})
-                        
                         for extra in ["dall-e-3", "whisper-1", "tts-1"]:
                             if not any(x["id"] == extra for x in new_openai):
                                 new_openai.append({"id": extra, "object": "model", "created": now, "owned_by": "google"})
-                                
                         with dynamic_models_lock:
                             if new_rr:
                                 DYNAMIC_MODELS = new_rr
-                            OPENAI_MODELS_LIST = new_openai
+                                OPENAI_MODELS_LIST = new_openai
                         break
                 except Exception as e:
                     print(f"Model refresh error: {e}")
-                    
         if not DYNAMIC_MODELS:
             time.sleep(60)
         else:
-            time.sleep(86400)
+            time.sleep(3600)  # refresh hourly so new/updated models show up sooner
 
 threading.Thread(target=refresh_models_loop, daemon=True).start()
 
@@ -108,13 +106,12 @@ def get_combo_sequence(is_round_robin):
         active_models = get_active_models()
         if not API_KEYS or not active_models:
             return []
-            
+
         K = len(API_KEYS)
         M = len(active_models)
-        
         start_k = current_key_idx % K
         start_m = current_model_idx % M
-        
+
         combos = []
         if is_round_robin:
             start_idx = start_k * M + start_m
@@ -124,19 +121,22 @@ def get_combo_sequence(is_round_robin):
                 m_idx = idx % M
                 key = API_KEYS[k_idx]
                 model = active_models[m_idx]
-                
-                if key in key_penalties and now < key_penalties[key]:
+                # FIX: penalty is now checked per (key, model) pair, not per key.
+                # A key that hit its daily limit on one model is still usable
+                # for every other model that still has quota.
+                pen_key = (key, model['name'])
+                if pen_key in key_penalties and now < key_penalties[pen_key]:
                     continue
-                    
                 combos.append((k_idx, m_idx, key, model['name']))
         else:
+            # Specific model requested. We still need to skip (key, model)
+            # combos that are penalized for THIS model, otherwise a key that
+            # is exhausted just for this one model will be retried pointlessly.
             for i in range(K):
                 k_idx = (start_k + i) % K
                 key = API_KEYS[k_idx]
-                if key in key_penalties and now < key_penalties[key]:
-                    continue
                 combos.append((k_idx, -1, key, None))
-                
+
         return combos
 
 def set_sticky_success(k_idx, m_idx):
@@ -171,16 +171,15 @@ def requires_browser_auth(f):
 def strict_password_and_log():
     if request.method == 'OPTIONS':
         return
-        
+
     # Exclude system routes from API password check (Logs has its own browser auth)
     if request.path in ['/ping', '/healthz', '/logs', '/dashboard_data']:
         return
-        
+
     expected_pass = os.environ.get("PASSWORD", "")
     auth_header = request.headers.get("Authorization", "")
-    
     is_correct = (auth_header == f"Bearer {expected_pass}")
-    
+
     # Extract message and parameters
     msg = ""
     params_str = ""
@@ -192,7 +191,7 @@ def strict_password_and_log():
                 msg = body["messages"][-1].get("content", "")
         except Exception as e:
             params_str = str(e)
-            
+
     if not params_str and request.args:
         params_str = json.dumps(dict(request.args), indent=2)
 
@@ -213,10 +212,9 @@ def strict_password_and_log():
         "params": params_str,
         "status": "Pending..."
     }
-    
     g.log_entry = log_entry
     request_logs.appendleft(log_entry)
-    
+
     if not is_correct:
         log_entry["status"] = "401 Blocked (Hacker/Wrong Pass)"
         return jsonify({"error": "Unauthorized Access. Invalid Password."}), 401
@@ -235,13 +233,16 @@ def update_log_status(response):
 @requires_browser_auth
 def api_dashboard_data():
     now = time.time()
-    penalized = {k[:5]+"..."+k[-5:]: round((ts - now)/60, 1) for k, ts in key_penalties.items()}
-    
+    # FIX: key is now a (key, model) tuple, format it accordingly.
+    penalized = {
+        f"{k[0][:5]}...{k[0][-5:]} [{k[1]}]": round((ts - now) / 60, 1)
+        for k, ts in key_penalties.items()
+    }
     return jsonify({
         "metrics": metrics,
         "active_keys": len(API_KEYS),
         "penalized_keys": penalized,
-        "models": MODELS,
+        "models": get_active_models(),
         "logs": list(request_logs)
     })
 
@@ -249,329 +250,318 @@ def api_dashboard_data():
 @requires_browser_auth
 def view_logs():
     html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>WAPI Dashboard</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <style>
-            body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #121212; color: #e0e0e0; }
-            .container { max-width: 1400px; margin: 0 auto; }
-            h1 { color: #ffffff; text-align: center; margin-bottom: 20px; text-shadow: 0 0 10px rgba(255,255,255,0.2); display: flex; justify-content: center; align-items: center; gap: 15px;}
-            
-            /* Status Panel */
-            .status-panel { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 25px; }
-            .card { background: #1e1e1e; border-radius: 8px; padding: 15px; flex: 1; min-width: 200px; border: 1px solid #333; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }
-            .card h3 { margin: 0 0 10px 0; font-size: 0.9em; color: #888; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #333; padding-bottom: 5px; }
-            .card .val { font-size: 1.8em; font-weight: bold; color: #fff; margin-bottom: 5px; }
-            .card .sub { font-size: 0.8em; color: #a1a1aa; }
-            
-            .table-wrapper { background: #1e1e1e; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); overflow-x: auto; border: 1px solid #333; margin-bottom: 30px;}
-            table { width: 100%; border-collapse: collapse; min-width: 900px; }
-            th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #333; }
-            th { background-color: #2c2c2c; color: #ffffff; font-weight: 600; font-size: 0.95em; text-transform: uppercase; letter-spacing: 0.5px; }
-            tr:hover { background-color: #252525; }
-            
-            .msg { max-width: 400px; white-space: pre-wrap; word-break: break-word; font-size: 0.9em; color: #ce9178; background: #18181b; padding: 8px; border-radius: 4px; font-family: monospace; }
-            .pwd-wrong { font-family: monospace; color: #fca5a5; background: #451a1a; padding: 3px 6px; border-radius: 3px; font-size: 0.9em; }
-            .pwd-correct { font-family: monospace; color: #4ade80; font-style: italic; font-size: 0.9em; font-weight: bold; }
-            .ip { font-family: monospace; color: #93c5fd; }
-            .badge { padding: 4px 8px; border-radius: 4px; font-size: 0.85em; font-weight: bold; }
-            .bg-green { background: rgba(74, 222, 128, 0.2); color: #4ade80; }
-            .bg-red { background: rgba(248, 113, 113, 0.2); color: #f87171; }
-            
-            .flex-col { display: flex; flex-direction: column; gap: 5px; }
-            .tag { background: #333; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; color: #ccc; border: 1px solid #444;}
-            
-            .btn { background: #3b82f6; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 0.9em; transition: 0.2s; }
-            .btn:hover { background: #2563eb; }
-            
-            .usage-table th { background-color: #1f2937; }
-            .params-box { display: none; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>
-                🚀 WAPI Live Dashboard
-                <button class="btn" onclick="fetchData()" id="refresh-btn">🔄 Refresh</button>
-            </h1>
-            
-            <!-- Error message container -->
-            <div id="error-msg" style="color: #fca5a5; background: #451a1a; padding: 10px; border-radius: 5px; text-align: center; display: none; margin-bottom: 15px;"></div>
+<!DOCTYPE html>
+<html>
+<head>
+<title>WAPI Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background-color: #121212; color: #e0e0e0; }
+.container { max-width: 1400px; margin: 0 auto; }
+h1 { color: #ffffff; text-align: center; margin-bottom: 20px; text-shadow: 0 0 10px rgba(255,255,255,0.2); display: flex; justify-content: center; align-items: center; gap: 15px;}
+/* Status Panel */
+.status-panel { display: flex; flex-wrap: wrap; gap: 15px; margin-bottom: 25px; }
+.card { background: #1e1e1e; border-radius: 8px; padding: 15px; flex: 1; min-width: 200px; border: 1px solid #333; box-shadow: 0 4px 10px rgba(0,0,0,0.3); }
+.card h3 { margin: 0 0 10px 0; font-size: 0.9em; color: #888; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #333; padding-bottom: 5px; }
+.card .val { font-size: 1.8em; font-weight: bold; color: #fff; margin-bottom: 5px; }
+.card .sub { font-size: 0.8em; color: #a1a1aa; }
+.table-wrapper { background: #1e1e1e; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); overflow-x: auto; border: 1px solid #333; margin-bottom: 30px;}
+table { width: 100%; border-collapse: collapse; min-width: 900px; }
+th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #333; }
+th { background-color: #2c2c2c; color: #ffffff; font-weight: 600; font-size: 0.95em; text-transform: uppercase; letter-spacing: 0.5px; }
+tr:hover { background-color: #252525; }
+.msg { max-width: 400px; white-space: pre-wrap; word-break: break-word; font-size: 0.9em; color: #ce9178; background: #18181b; padding: 8px; border-radius: 4px; font-family: monospace; }
+.pwd-wrong { font-family: monospace; color: #fca5a5; background: #451a1a; padding: 3px 6px; border-radius: 3px; font-size: 0.9em; }
+.pwd-correct { font-family: monospace; color: #4ade80; font-style: italic; font-size: 0.9em; font-weight: bold; }
+.ip { font-family: monospace; color: #93c5fd; }
+.badge { padding: 4px 8px; border-radius: 4px; font-size: 0.85em; font-weight: bold; }
+.bg-green { background: rgba(74, 222, 128, 0.2); color: #4ade80; }
+.bg-red { background: rgba(248, 113, 113, 0.2); color: #f87171; }
+.flex-col { display: flex; flex-direction: column; gap: 5px; }
+.tag { background: #333; padding: 2px 6px; border-radius: 4px; font-size: 0.8em; color: #ccc; border: 1px solid #444;}
+.btn { background: #3b82f6; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 0.9em; transition: 0.2s; }
+.btn:hover { background: #2563eb; }
+.usage-table th { background-color: #1f2937; }
+.params-box { display: none; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>
+🚀 WAPI Live Dashboard
+<button class="btn" onclick="fetchData()" id="refresh-btn">🔄 Refresh</button>
+</h1>
+<!-- Error message container -->
+<div id="error-msg" style="color: #fca5a5; background: #451a1a; padding: 10px; border-radius: 5px; text-align: center; display: none; margin-bottom: 15px;"></div>
+<div class="status-panel" id="status-panel">
+<div class="card" style="text-align:center; padding: 30px;">Loading dashboard metrics...</div>
+</div>
+<div class="status-panel" id="usage-panel">
+<!-- Usage by key will go here -->
+</div>
+<h2 style="display:flex; justify-content:space-between; align-items:center; font-size: 1.2em; color: #ccc; border-bottom: 1px solid #333; padding-bottom: 10px;">
+🔐 Secure Access Logs
+<button class="btn" onclick="toggleAllParams()" id="toggle-btn">👁️ Show All Params</button>
+</h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr>
+<th>Time</th>
+<th>IP Address</th>
+<th>Attempted Password</th>
+<th>Status</th>
+<th>Message / Prompt</th>
+<th>Parameters</th>
+</tr>
+</thead>
+<tbody id="logs-body">
+<tr><td colspan="6" style="text-align: center; color: #666; padding: 30px;">Loading logs...</td></tr>
+</tbody>
+</table>
+</div>
+</div>
+<script>
+let isSelecting = false;
+let allParamsVisible = false;
 
-            <div class="status-panel" id="status-panel">
-                <div class="card" style="text-align:center; padding: 30px;">Loading dashboard metrics...</div>
-            </div>
-            
-            <div class="status-panel" id="usage-panel">
-                <!-- Usage by key will go here -->
-            </div>
-            
-            <h2 style="display:flex; justify-content:space-between; align-items:center; font-size: 1.2em; color: #ccc; border-bottom: 1px solid #333; padding-bottom: 10px;">
-                🔐 Secure Access Logs
-                <button class="btn" onclick="toggleAllParams()" id="toggle-btn">👁️ Show All Params</button>
-            </h2>
-            <div class="table-wrapper">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Time</th>
-                            <th>IP Address</th>
-                            <th>Attempted Password</th>
-                            <th>Status</th>
-                            <th>Message / Prompt</th>
-                            <th>Parameters</th>
-                        </tr>
-                    </thead>
-                    <tbody id="logs-body">
-                        <tr><td colspan="6" style="text-align: center; color: #666; padding: 30px;">Loading logs...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
+function toggleParams(idx) {
+    const el = document.getElementById('params-' + idx);
+    el.style.display = (el.style.display === 'none' || el.style.display === '') ? 'block' : 'none';
+}
 
-        <script>
-            let isSelecting = false;
-            let allParamsVisible = false;
-            
-            function toggleParams(idx) {
-                const el = document.getElementById('params-' + idx);
-                el.style.display = (el.style.display === 'none' || el.style.display === '') ? 'block' : 'none';
-            }
-            
-            function toggleAllParams() {
-                allParamsVisible = !allParamsVisible;
-                document.getElementById('toggle-btn').innerText = allParamsVisible ? '🙈 Hide All Params' : '👁️ Show All Params';
-                const boxes = document.getElementsByClassName('params-box');
-                for (let box of boxes) {
-                    box.style.display = allParamsVisible ? 'block' : 'none';
-                }
-            }
-            
-            document.addEventListener('selectionchange', () => {
-                const selection = window.getSelection();
-                isSelecting = selection.toString().length > 0;
-            });
+function toggleAllParams() {
+    allParamsVisible = !allParamsVisible;
+    document.getElementById('toggle-btn').innerText = allParamsVisible ? '🙈 Hide All Params' : '👁️ Show All Params';
+    const boxes = document.getElementsByClassName('params-box');
+    for (let box of boxes) {
+        box.style.display = allParamsVisible ? 'block' : 'none';
+    }
+}
 
-            async function fetchData() {
-                const refreshBtn = document.getElementById('refresh-btn');
-                refreshBtn.innerText = "⏳...";
-                
-                try {
-                    const response = await fetch('/router/dashboard_data', { credentials: 'same-origin' });
-                    
-                    if (!response.ok) {
-                        throw new Error("HTTP " + response.status);
-                    }
-                    
-                    const data = await response.json();
-                    
-                    document.getElementById('error-msg').style.display = 'none';
-                    
-                    if (!isSelecting) {
-                        updateUI(data);
-                    }
-                } catch (error) {
-                    console.error("Error fetching data:", error);
-                    const errMsg = document.getElementById('error-msg');
-                    errMsg.style.display = 'block';
-                    errMsg.innerText = "⚠️ Could not load data. " + error.message;
-                }
-                
-                refreshBtn.innerText = "🔄 Refresh";
-            }
+document.addEventListener('selectionchange', () => {
+    const selection = window.getSelection();
+    isSelecting = selection.toString().length > 0;
+});
 
-            function updateUI(data) {
-                const metrics = data.metrics;
-                
-                // --- 1. Top Cards ---
-                let penalizedHtml = '';
-                if (Object.keys(data.penalized_keys).length > 0) {
-                    for (const [k, v] of Object.entries(data.penalized_keys)) {
-                        penalizedHtml += `<span class="tag" style="background: rgba(248,113,113,0.2); color: #f87171; border-color: #f87171;">${k} (${v}m)</span>`;
-                    }
-                } else {
-                    penalizedHtml = `<span style="color: #4ade80;">All Clear</span>`;
-                }
+async function fetchData() {
+    const refreshBtn = document.getElementById('refresh-btn');
+    refreshBtn.innerText = "⏳...";
+    try {
+        const response = await fetch('/router/dashboard_data', { credentials: 'same-origin' });
+        if (!response.ok) {
+            throw new Error("HTTP " + response.status);
+        }
+        const data = await response.json();
+        document.getElementById('error-msg').style.display = 'none';
+        if (!isSelecting) {
+            updateUI(data);
+        }
+    } catch (error) {
+        console.error("Error fetching data:", error);
+        const errMsg = document.getElementById('error-msg');
+        errMsg.style.display = 'block';
+        errMsg.innerText = "⚠️ Could not load data. " + error.message;
+    }
+    refreshBtn.innerText = "🔄 Refresh";
+}
 
-                let modelsHtml = '';
-                data.models.forEach(m => {
-                    let totalUsed = 0;
-                    let keysHtml = '';
-                    let exhaustedKeys = 0;
-                    let penalizedForThisModel = 0;
-                    
-                    const usageKeys = Object.keys(metrics.usage_by_key || {});
-                    usageKeys.forEach(keyPrefix => {
-                        const count = metrics.usage_by_key[keyPrefix][m.name] || 0;
-                        if(count > 0) {
-                            totalUsed += count;
-                            let remaining = m.rpd - count;
-                            if(remaining < 0) remaining = 0;
-                            
-                            if(remaining === 0) exhaustedKeys++;
-                            if(data.penalized_keys[keyPrefix]) penalizedForThisModel++;
-                            
-                            let color = remaining > 100 ? '#4ade80' : (remaining > 10 ? '#fbbf24' : '#f87171');
-                            let penStatus = data.penalized_keys[keyPrefix] ? ` <span style="color:#f87171;font-weight:bold;">(Blocked)</span>` : '';
-                            
-                            keysHtml += `
-                                <div style="display:flex; justify-content:space-between; font-size:0.85em; padding:3px 0; border-bottom:1px solid #333;">
-                                    <span style="font-family:monospace; color:#93c5fd;">${keyPrefix}${penStatus}</span>
-                                    <span>Used: <strong style="color:#fff;">${count}</strong> | Rem: <strong style="color:${color};">${remaining}</strong></span>
-                                </div>
-                            `;
-                        }
-                    });
-                    
-                    if(keysHtml === '') {
-                        keysHtml = '<div style="font-size:0.85em; color:#666; padding:5px 0;">No usage yet.</div>';
-                    }
-                    
-                    let badgeHtml = '';
-                    if (exhaustedKeys > 0) {
-                        badgeHtml += `<span style="background:rgba(248,113,113,0.2); color:#f87171; padding:2px 6px; border-radius:4px; font-size:0.8em; margin-left:5px; font-weight:bold;">⚠️ Limit Reached</span>`;
-                    } else if (penalizedForThisModel > 0) {
-                        badgeHtml += `<span style="background:rgba(251,191,36,0.2); color:#fbbf24; padding:2px 6px; border-radius:4px; font-size:0.8em; margin-left:5px; font-weight:bold;">⚠️ Key Blocked</span>`;
-                    }
+function updateUI(data) {
+    const metrics = data.metrics;
 
-                    modelsHtml += `
-                        <div class="model-box" style="background:#252526; border:1px solid #444; border-radius:6px; margin-bottom:10px; overflow:hidden;">
-                            <div class="model-header" onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none'" style="cursor:pointer; padding:8px 12px; display:flex; justify-content:space-between; align-items:center; background:#2d2d30;">
-                                <div>
-                                    <strong style="color:#e0e0e0; font-size:0.95em;">${m.name}</strong>
-                                    ${badgeHtml}
-                                </div>
-                                <div style="display:flex; gap:10px; align-items:center;">
-                                    <span style="color:#4ade80; font-size:0.85em; font-weight:bold;">Used: ${totalUsed}</span>
-                                    <span style="font-size:0.8em; color:#aaa; background:#1e1e1e; padding:2px 6px; border-radius:4px; border:1px solid #444;">${m.rpm} RPM | ${m.rpd} RPD</span>
-                                </div>
-                            </div>
-                            <div class="model-details" style="display:none; padding:10px; background:#1e1e1e;">
-                                <div style="font-size:0.85em; color:#888; margin-bottom:5px;">Session Usage by Key:</div>
-                                ${keysHtml}
-                            </div>
-                        </div>
-                    `;
-                });
+    // --- 1. Top Cards ---
+    let penalizedHtml = '';
+    if (Object.keys(data.penalized_keys).length > 0) {
+        for (const [k, v] of Object.entries(data.penalized_keys)) {
+            penalizedHtml += `<span class="tag" style="background: rgba(248,113,113,0.2); color: #f87171; border-color: #f87171;">${k} (${v}m)</span>`;
+        }
+    } else {
+        penalizedHtml = `<span style="color: #4ade80;">All Clear</span>`;
+    }
 
-                document.getElementById('status-panel').innerHTML = `
-                    <div class="card">
-                        <h3>Active Keys</h3>
-                        <div class="val" style="color: #60a5fa;">${data.active_keys}</div>
-                        <div class="sub flex-col">Penalized: <div style="display:flex; flex-wrap:wrap; gap:5px; margin-top:5px;">${penalizedHtml}</div></div>
-                    </div>
-                    <div class="card">
-                        <h3>API Traffic</h3>
-                        <div class="val">${metrics.total_incoming_requests}</div>
-                        <div class="sub">Total Requests</div>
-                    </div>
-                    <div class="card">
-                        <h3>Google API</h3>
-                        <div class="val" style="color: #4ade80;">${metrics.successful_api_calls}</div>
-                        <div class="sub">Limits Hit: <span style="color:#f87171">${metrics.rate_limit_hits}</span></div>
-                    </div>
-                    <div class="card">
-                        <h3>Fallback</h3>
-                        <div class="val" style="color: #fbbf24;">${metrics.fallback_calls}</div>
-                        <div class="sub">Failed Requests: <span style="color:#f87171">${metrics.failed_requests}</span></div>
-                    </div>
-                    <div class="card" style="flex: 2;">
-                        <h3>🤖 Active Models (Click to view Key usage & RPD)</h3>
-                        <div class="flex-col">
-                            ${modelsHtml}
-                        </div>
+    let modelsHtml = '';
+    data.models.forEach(m => {
+        let totalUsed = 0;
+        let keysHtml = '';
+        let exhaustedKeys = 0;
+        let penalizedForThisModel = 0;
+
+        const usageKeys = Object.keys(metrics.usage_by_key || {});
+        usageKeys.forEach(keyPrefix => {
+            const count = metrics.usage_by_key[keyPrefix][m.name] || 0;
+            if(count > 0) {
+                totalUsed += count;
+                let remaining = m.rpd - count;
+                if(remaining < 0) remaining = 0;
+                if(remaining === 0) exhaustedKeys++;
+
+                let color = remaining > 100 ? '#4ade80' : (remaining > 10 ? '#fbbf24' : '#f87171');
+                keysHtml += `
+                    <div style="display:flex; justify-content:space-between; font-size:0.85em; padding:3px 0; border-bottom:1px solid #333;">
+                        <span style="font-family:monospace; color:#93c5fd;">${keyPrefix}</span>
+                        <span>Used: <strong style="color:#fff;">${count}</strong> | Rem: <strong style="color:${color};">${remaining}</strong></span>
                     </div>
                 `;
-
-                const tbody = document.getElementById('logs-body');
-                if (data.logs.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #666; padding: 30px;">No requests logged yet.</td></tr>';
-                    return;
-                }
-
-                let html = '';
-                data.logs.forEach((log, idx) => {
-                    const pwdClass = log.is_correct ? 'pwd-correct' : 'pwd-wrong';
-                    const pwdText = log.is_correct ? '🛡️ ' + log.password_used : (log.password_used || 'NONE');
-                    const badgeClass = log.is_correct ? 'bg-green' : 'bg-red';
-                    
-                    html += `
-                        <tr>
-                            <td style="white-space: nowrap; color: #888; font-size: 0.9em;">${log.time || ''}</td>
-                            <td class="ip">${log.ip || ''}</td>
-                            <td><span class="${pwdClass}">${escapeHtml(pwdText)}</span></td>
-                            <td><span class="badge ${badgeClass}">${escapeHtml(log.status || '')}</span></td>
-                            <td><div class="msg">${escapeHtml(log.message || 'No message')}</div></td>
-                            <td>
-                                <button class="btn" style="padding: 2px 6px; font-size: 0.7em; margin-bottom: 5px;" onclick="toggleParams(${idx})">Show Params</button>
-                                <div id="params-${idx}" class="msg params-box" style="display: none; max-height: 150px; overflow-y: auto; max-width: 300px;">${escapeHtml(log.params || 'No parameters')}</div>
-                            </td>
-                        </tr>
-                    `;
-                });
-                tbody.innerHTML = html;
             }
+        });
+        if(keysHtml === '') {
+            keysHtml = '<div style="font-size:0.85em; color:#666; padding:5px 0;">No usage yet.</div>';
+        }
 
-            function toggleParams(idx) {
-                const el = document.getElementById('params-' + idx);
-                if (el.style.display === 'none') {
-                    el.style.display = 'block';
-                } else {
-                    el.style.display = 'none';
-                }
-            }
+        let badgeHtml = '';
+        if (exhaustedKeys > 0) {
+            badgeHtml += `<span style="background:rgba(248,113,113,0.2); color:#f87171; padding:2px 6px; border-radius:4px; font-size:0.8em; margin-left:5px; font-weight:bold;">⚠️ Limit Reached</span>`;
+        }
 
-            function escapeHtml(unsafe) {
-                return (unsafe || '').toString()
-                     .replace(/&/g, "&amp;")
-                     .replace(/</g, "&lt;")
-                     .replace(/>/g, "&gt;")
-                     .replace(/"/g, "&quot;")
-                     .replace(/'/g, "&#039;");
-            }
+        modelsHtml += `
+            <div class="model-box" style="background:#252526; border:1px solid #444; border-radius:6px; margin-bottom:10px; overflow:hidden;">
+                <div class="model-header" onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none'" style="cursor:pointer; padding:8px 12px; display:flex; justify-content:space-between; align-items:center; background:#2d2d30;">
+                    <div>
+                        <strong style="color:#e0e0e0; font-size:0.95em;">${m.name}</strong>
+                        ${badgeHtml}
+                    </div>
+                    <div style="display:flex; gap:10px; align-items:center;">
+                        <span style="color:#4ade80; font-size:0.85em; font-weight:bold;">Used: ${totalUsed}</span>
+                        <span style="font-size:0.8em; color:#aaa; background:#1e1e1e; padding:2px 6px; border-radius:4px; border:1px solid #444;">${m.rpm} RPM | ${m.rpd} RPD</span>
+                    </div>
+                </div>
+                <div class="model-details" style="display:none; padding:10px; background:#1e1e1e;">
+                    <div style="font-size:0.85em; color:#888; margin-bottom:5px;">Session Usage by Key:</div>
+                    ${keysHtml}
+                </div>
+            </div>
+        `;
+    });
 
-            fetchData();
-            setInterval(fetchData, 5000);
-        </script>
-    </body>
-    </html>
-    """
+    document.getElementById('status-panel').innerHTML = `
+        <div class="card">
+            <h3>Active Keys</h3>
+            <div class="val" style="color: #60a5fa;">${data.active_keys}</div>
+            <div class="sub flex-col">Penalized: <div style="display:flex; flex-wrap:wrap; gap:5px; margin-top:5px;">${penalizedHtml}</div></div>
+        </div>
+        <div class="card">
+            <h3>API Traffic</h3>
+            <div class="val">${metrics.total_incoming_requests}</div>
+            <div class="sub">Total Requests</div>
+        </div>
+        <div class="card">
+            <h3>Google API</h3>
+            <div class="val" style="color: #4ade80;">${metrics.successful_api_calls}</div>
+            <div class="sub">Limits Hit: <span style="color:#f87171">${metrics.rate_limit_hits}</span></div>
+        </div>
+        <div class="card">
+            <h3>Fallback</h3>
+            <div class="val" style="color: #fbbf24;">${metrics.fallback_calls}</div>
+            <div class="sub">Failed Requests: <span style="color:#f87171">${metrics.failed_requests}</span></div>
+        </div>
+        <div class="card" style="flex: 2;">
+            <h3>🤖 Active Models (Click to view Key usage & RPD)</h3>
+            <div class="flex-col">
+                ${modelsHtml}
+            </div>
+        </div>
+    `;
+
+    const tbody = document.getElementById('logs-body');
+    if (data.logs.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: #666; padding: 30px;">No requests logged yet.</td></tr>';
+        return;
+    }
+
+    let html = '';
+    data.logs.forEach((log, idx) => {
+        const pwdClass = log.is_correct ? 'pwd-correct' : 'pwd-wrong';
+        const pwdText = log.is_correct ? '🛡️ ' + log.password_used : (log.password_used || 'NONE');
+        const badgeClass = log.is_correct ? 'bg-green' : 'bg-red';
+
+        html += `
+            <tr>
+                <td style="white-space: nowrap; color: #888; font-size: 0.9em;">${log.time || ''}</td>
+                <td class="ip">${log.ip || ''}</td>
+                <td><span class="${pwdClass}">${escapeHtml(pwdText)}</span></td>
+                <td><span class="badge ${badgeClass}">${escapeHtml(log.status || '')}</span></td>
+                <td><div class="msg">${escapeHtml(log.message || 'No message')}</div></td>
+                <td>
+                    <button class="btn" style="padding: 2px 6px; font-size: 0.7em; margin-bottom: 5px;" onclick="toggleParams(${idx})">Show Params</button>
+                    <div id="params-${idx}" class="msg params-box" style="display: none; max-height: 150px; overflow-y: auto; max-width: 300px;">${escapeHtml(log.params || 'No parameters')}</div>
+                </td>
+            </tr>
+        `;
+    });
+    tbody.innerHTML = html;
+}
+
+function toggleParams(idx) {
+    const el = document.getElementById('params-' + idx);
+    if (el.style.display === 'none') {
+        el.style.display = 'block';
+    } else {
+        el.style.display = 'none';
+    }
+}
+
+function escapeHtml(unsafe) {
+    return (unsafe || '').toString()
+         .replace(/&/g, "&amp;")
+         .replace(/</g, "&lt;")
+         .replace(/>/g, "&gt;")
+         .replace(/"/g, "&quot;")
+         .replace(/'/g, "&#039;");
+}
+
+fetchData();
+setInterval(fetchData, 5000);
+</script>
+</body>
+</html>
+"""
     return render_template_string(html)
+
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 def proxy_chat():
     if request.method == 'OPTIONS':
         return Response(status=200)
-        
+
     with state_lock:
         metrics["total_incoming_requests"] += 1
-        
+
     data = request.json or {}
     data.pop('session_id', None)
     data.pop('user', None)
+
     requested_model = data.get("model", "")
-    
+
     # Fetch ALL valid combos based on Round-Robin or Specific Model
     is_round_robin = requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model", ""]
     combos = get_combo_sequence(is_round_robin)
-    
+
     last_resp = None
-    
+
     for k_idx, m_idx, key, rr_model_name in combos:
         actual_model = rr_model_name if is_round_robin else requested_model
+
+        # FIX: for a specifically-requested (non round-robin) model, skip this
+        # (key, model) combo if it is currently penalized for THAT model.
+        if not is_round_robin:
+            now = time.time()
+            pen_key = (key, actual_model)
+            with state_lock:
+                penalized_until = key_penalties.get(pen_key)
+            if penalized_until and now < penalized_until:
+                continue
+
         data["model"] = actual_model
-        
+
         headers = {
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json"
         }
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        
+
         try:
             resp = requests.post(url, json=data, headers=headers, stream=True)
             last_resp = resp
-            
+
             if resp.status_code == 200:
                 set_sticky_success(k_idx, m_idx)
                 if hasattr(g, "log_entry"): g.log_entry["status"] = f"200 Success ({actual_model})"
@@ -583,14 +573,15 @@ def proxy_chat():
                     if actual_model not in metrics["usage_by_key"][safe_key]:
                         metrics["usage_by_key"][safe_key][actual_model] = 0
                     metrics["usage_by_key"][safe_key][actual_model] += 1
-                    
+
                 excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
                 out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
                                if name.lower() not in excluded_headers]
                 return Response(resp.content, resp.status_code, out_headers)
-                
+
             elif resp.status_code in [429, 403]:
                 error_text = resp.text.lower() if hasattr(resp, 'text') else ""
+
                 if "per day" in error_text:
                     import datetime
                     now_utc = datetime.datetime.utcnow()
@@ -599,20 +590,22 @@ def proxy_chat():
                     next_midnight_ist = datetime.datetime(now_ist.year, now_ist.month, now_ist.day) + datetime.timedelta(days=1)
                     next_midnight_utc = next_midnight_ist - ist_offset
                     unlock_time = next_midnight_utc.timestamp()
-                    print(f"Key {key[:5]}... hit DAILY LIMIT. Penalized until Midnight IST.")
+
+                    # FIX: penalize only this (key, model) pair, not the whole key.
+                    print(f"Key {key[:5]}... hit DAILY LIMIT for model {actual_model}. Penalized (this model only) until Midnight IST.")
                     with state_lock:
-                        key_penalties[key] = unlock_time
+                        key_penalties[(key, actual_model)] = unlock_time
                         metrics["rate_limit_hits"] += 1
                 else:
-                    print(f"Key {key[:5]}... hit 429/403 limit. Skipping to next combo (NO PENALTY).")
+                    print(f"Key {key[:5]}... hit 429/403 limit on {actual_model}. Skipping to next combo (NO PENALTY).")
                     with state_lock:
                         metrics["rate_limit_hits"] += 1
                 continue
-                
+
             elif resp.status_code in [500, 503]:
                 print(f"Model {actual_model} error ({resp.status_code}). Trying next combo...")
                 continue
-                
+
             elif resp.status_code in [404, 400]:
                 print(f"Model {actual_model} error ({resp.status_code}). Removing from active lists permanently.")
                 with dynamic_models_lock:
@@ -620,7 +613,7 @@ def proxy_chat():
                     DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
                     OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
                 continue
-                
+
             else:
                 # Other responses (e.g. 401 Unauthorized), just return them
                 with state_lock:
@@ -629,11 +622,11 @@ def proxy_chat():
                 out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
                                if name.lower() not in excluded_headers]
                 return Response(resp.content, resp.status_code, out_headers)
-                
+
         except Exception as e:
             print(f"API call error: {e}")
             continue
-            
+
     if last_resp is not None:
         with state_lock:
             metrics["failed_requests"] += 1
@@ -641,21 +634,22 @@ def proxy_chat():
         out_headers = [(name, value) for (name, value) in last_resp.raw.headers.items()
                        if name.lower() not in excluded_headers]
         return Response(last_resp.content, last_resp.status_code, out_headers)
-        
+
     return jsonify({"error": {"message": "All API keys are currently rate-limited (429) or exhausted. Please wait 1 minute.", "type": "rate_limit_error"}}), 429
 
 @app.route('/v1/audio/transcriptions', methods=['POST', 'OPTIONS'])
 def proxy_transcriptions():
     if request.method == 'OPTIONS':
         return Response(status=200)
+
     if 'file' not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
-        
+
     file = request.files['file']
     audio_bytes = file.read()
     b64_audio = base64.b64encode(audio_bytes).decode('utf-8')
     mime_type = file.content_type or "audio/wav"
-    
+
     data = {
         "contents": [{
             "parts": [
@@ -665,10 +659,10 @@ def proxy_transcriptions():
         }],
         "generationConfig": {"temperature": 0.0}
     }
-    
+
     combos = get_combo_sequence(False)
     last_resp = None
-    
+
     for k_idx, m_idx, key, _ in combos:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
         headers = {"Content-Type": "application/json"}
@@ -693,27 +687,27 @@ def proxy_transcriptions():
                 return Response(resp.content, resp.status_code)
         except Exception as e:
             continue
-            
+
     if last_resp is not None:
         return Response(last_resp.content, last_resp.status_code)
+
     return jsonify({"error": {"message": "All API keys are currently rate-limited (429) or exhausted.", "type": "rate_limit"}}), 429
 
 @app.route('/v1/models', methods=['GET', 'OPTIONS'])
 def proxy_models():
     if request.method == 'OPTIONS':
         return Response(status=200)
-        
+
     with dynamic_models_lock:
         if OPENAI_MODELS_LIST:
             return jsonify({"object": "list", "data": OPENAI_MODELS_LIST})
-            
+
     models_list = [
         "gemini-1.5-flash", "gemini-1.5-pro", "gemini-3.5-flash", "gemini-3.5-pro", "gemini-pro",
         "gemini-working-model", "gemini-1.5-pro-exp-0801", "gemini-1.5-pro-exp-0827",
         "gemini-1.5-flash-exp-0827", "gemini-1.5-flash-8b-exp-0827", "gemini-1.5-flash-8b-exp-0924",
         "text-embedding-004", "gemini-embedding-2", "dall-e-3", "whisper-1", "tts-1"
     ]
-    
     data = []
     now = int(time.time())
     for m in models_list:
@@ -723,7 +717,6 @@ def proxy_models():
             "created": now,
             "owned_by": "google"
         })
-        
     return jsonify({
         "object": "list",
         "data": data
@@ -734,7 +727,7 @@ def add_key_model():
     expected_pass = os.environ.get("PASSWORD", "")
     if request.headers.get("Authorization") != f"Bearer {expected_pass}":
         return jsonify({"error": "Unauthorized"}), 401
-        
+
     data = request.json
     with state_lock:
         if "key" in data and data["key"] not in API_KEYS:
@@ -742,16 +735,20 @@ def add_key_model():
         if "model" in data and "rpm" in data:
             MODELS.append({"name": data["model"], "rpm": int(data["rpm"])})
     return jsonify({"status": "success", "keys_count": len(API_KEYS), "models": MODELS})
-    
+
 @app.route('/status', methods=['GET'])
 def get_status():
     now = time.time()
-    penalized = {k[:5]+"..."+k[-5:]: round((ts - now)/60, 1) for k, ts in key_penalties.items()} # minutes left
+    # FIX: key is now a (key, model) tuple, format it accordingly.
+    penalized = {
+        f"{k[0][:5]}...{k[0][-5:]} [{k[1]}]": round((ts - now) / 60, 1)
+        for k, ts in key_penalties.items()
+    }  # minutes left
     return jsonify({
         "metrics": metrics,
         "active_keys": len(API_KEYS),
         "penalized_keys_minutes_left": penalized,
-        "models": MODELS
+        "models": get_active_models()
     })
 
 if __name__ == '__main__':
