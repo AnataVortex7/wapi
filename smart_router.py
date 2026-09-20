@@ -614,19 +614,20 @@ def proxy_chat():
                                    if name.lower() not in excluded_headers]
                     return Response(resp.content, resp.status_code, out_headers)
 
-                if "quota" in error_text or "daily" in error_text or "exhausted" in error_text:
-                    # Only block until midnight IST if daily quota is actually exhausted
+                if "per day" in error_text:
+                    # Only block until midnight IST if strictly daily quota
+                    import datetime
                     now_utc = datetime.datetime.utcnow()
                     ist_offset = datetime.timedelta(hours=5, minutes=30)
                     now_ist = now_utc + ist_offset
                     next_midnight_ist = datetime.datetime(now_ist.year, now_ist.month, now_ist.day) + datetime.timedelta(days=1)
                     next_midnight_utc = next_midnight_ist - ist_offset
                     unlock_time = next_midnight_utc.timestamp()
-                    print(f"Key {key[:5]}...{key[-5:]} hit DAILY LIMIT. Penalized until Midnight IST.")
+                    print(f"Key {key[:5]}... hit DAILY LIMIT. Penalized until Midnight IST.")
                 else:
-                    # Regular RPM limit or other 429/403 -> block for only 2 minutes
-                    unlock_time = time.time() + 120
-                    print(f"Key {key[:5]}...{key[-5:]} hit RPM/403. Penalized for 2m.")
+                    # Regular RPM limit or other 429/403 -> block for 60 seconds
+                    unlock_time = time.time() + 60
+                    print(f"Key {key[:5]}... hit RPM/403. Penalized for 60s.")
                     
                 with state_lock:
                     key_penalties[key] = unlock_time
@@ -634,9 +635,17 @@ def proxy_chat():
                     
                 continue
                 
-            elif resp.status_code in [500, 503, 404]:
-                # Overload/500/503/404: Do NOT penalize or block keys. Try next combo.
+            elif resp.status_code in [500, 503]:
+                # Overload/500/503: Do NOT penalize or block keys. Try next combo.
                 print(f"Model {actual_model} error ({resp.status_code}). Trying next combo without blocking key...")
+                continue
+            elif resp.status_code in [404, 400]:
+                print(f"Model {actual_model} error ({resp.status_code}). Removing from active lists permanently.")
+                with dynamic_models_lock:
+                    global DYNAMIC_MODELS, OPENAI_MODELS_LIST
+                    DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
+                    OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
+                max_retries += 1  # Give a free retry
                 continue
             else:
                 # Other non-200 responses
@@ -660,7 +669,7 @@ def proxy_chat():
                        if name.lower() not in excluded_headers]
         return Response(last_resp.content, last_resp.status_code, out_headers)
         
-    return jsonify({"error": {"message": "All API keys and models failed.", "type": "server_error"}}), 500
+    return jsonify({"error": {"message": "All API keys are currently rate-limited (429) or exhausted. Please wait 1 minute.", "type": "rate_limit_error"}}), 429
 
 @app.route('/v1/audio/transcriptions', methods=['POST', 'OPTIONS'])
 def proxy_transcriptions():
@@ -719,7 +728,7 @@ def proxy_transcriptions():
             print(f"Transcription error: {e}")
             continue
 
-    return jsonify({"error": "All APIs failed for transcription."}), 500
+    return jsonify({"error": {"message": "All API keys are currently rate-limited (429) or exhausted.", "type": "rate_limit"}}), 429
 
 @app.route('/v1/embeddings', methods=['POST', 'OPTIONS'])
 def proxy_embeddings():
@@ -758,7 +767,7 @@ def proxy_embeddings():
             print(f"Embedding error: {e}")
             continue
             
-    return jsonify({"error": "All APIs failed for embeddings."}), 500
+    return jsonify({"error": {"message": "All API keys are currently rate-limited (429) or exhausted.", "type": "rate_limit"}}), 429
 
 @app.route('/v1/completions', methods=['POST', 'OPTIONS'])
 def proxy_completions():
@@ -832,7 +841,7 @@ def proxy_completions():
             print(f"Completions error: {e}")
             continue
             
-    return jsonify({"error": "All APIs failed for completions."}), 500
+    return jsonify({"error": {"message": "All API keys are currently rate-limited (429) or exhausted.", "type": "rate_limit"}}), 429
 
 @app.route('/v1/images/generations', methods=['POST', 'OPTIONS'])
 def proxy_images():
