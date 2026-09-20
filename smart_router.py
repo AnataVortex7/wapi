@@ -5,6 +5,7 @@ from functools import wraps
 from collections import deque
 import requests
 import base64
+import urllib.parse
 
 import hashlib
 
@@ -665,6 +666,157 @@ def proxy_transcriptions():
             continue
 
     return jsonify({"error": "All APIs failed for transcription."}), 500
+
+@app.route('/v1/embeddings', methods=['POST', 'OPTIONS'])
+def proxy_embeddings():
+    if request.method == 'OPTIONS':
+        return Response(status=200)
+    
+    data = request.json or {}
+    data['model'] = 'gemini-embedding-2' # Force standard embedding model
+    
+    max_retries = len(API_KEYS) if API_KEYS else 0
+    attempts = 0
+
+    while attempts < max_retries:
+        key, _ = get_next_available_combo()
+        if not key:
+            break
+        attempts += 1
+        
+        url = "https://generativelanguage.googleapis.com/v1beta/openai/embeddings"
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        
+        try:
+            resp = requests.post(url, headers=headers, json=data)
+            if resp.status_code == 200:
+                with state_lock:
+                    metrics["successful_api_calls"] += 1
+                return jsonify(resp.json())
+            elif resp.status_code in [429, 403]:
+                with state_lock:
+                    key_penalties[key] = time.time() + 120
+                    metrics["rate_limit_hits"] += 1
+                if attempts >= 1:
+                    return jsonify({"error": "Rate limit or Forbidden"}), resp.status_code
+                continue
+            elif resp.status_code in [500, 503]:
+                continue
+            else:
+                return Response(resp.content, resp.status_code)
+        except Exception as e:
+            print(f"Embedding error: {e}")
+            continue
+            
+    return jsonify({"error": "All APIs failed for embeddings."}), 500
+
+@app.route('/v1/completions', methods=['POST', 'OPTIONS'])
+def proxy_completions():
+    if request.method == 'OPTIONS':
+        return Response(status=200)
+    
+    data = request.json or {}
+    prompt = data.get("prompt", "")
+    if isinstance(prompt, list):
+        prompt = prompt[0] if prompt else ""
+        
+    chat_data = {
+        "model": data.get("model", "gemini-1.5-flash"),
+        "messages": [{"role": "user", "content": str(prompt)}]
+    }
+    
+    max_retries = len(API_KEYS) * len(MODELS) if API_KEYS and MODELS else 0
+    attempts = 0
+
+    while attempts < max_retries:
+        key, model_name = get_next_available_combo()
+        if not key:
+            break
+        attempts += 1
+        chat_data["model"] = model_name
+        
+        url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        
+        try:
+            resp = requests.post(url, headers=headers, json=chat_data)
+            if resp.status_code == 200:
+                with state_lock:
+                    metrics["successful_api_calls"] += 1
+                
+                chat_resp = resp.json()
+                try:
+                    text = chat_resp["choices"][0]["message"]["content"]
+                    return jsonify({
+                        "id": chat_resp.get("id", "cmpl-dummy"),
+                        "object": "text_completion",
+                        "created": chat_resp.get("created", int(time.time())),
+                        "model": model_name,
+                        "choices": [
+                            {"text": text, "index": 0, "finish_reason": "stop"}
+                        ],
+                        "usage": chat_resp.get("usage", {})
+                    })
+                except KeyError:
+                    return jsonify(chat_resp)
+            elif resp.status_code in [429, 403]:
+                with state_lock:
+                    key_penalties[key] = time.time() + 120
+                    metrics["rate_limit_hits"] += 1
+                if attempts >= 1:
+                    return jsonify({"error": "Rate limit or Forbidden"}), resp.status_code
+                continue
+            elif resp.status_code in [500, 503]:
+                continue
+            else:
+                return Response(resp.content, resp.status_code)
+        except Exception as e:
+            print(f"Completions error: {e}")
+            continue
+            
+    return jsonify({"error": "All APIs failed for completions."}), 500
+
+@app.route('/v1/images/generations', methods=['POST', 'OPTIONS'])
+def proxy_images():
+    if request.method == 'OPTIONS':
+        return Response(status=200)
+    
+    data = request.json or {}
+    prompt = data.get("prompt", "")
+    
+    if not prompt:
+        return jsonify({"error": "Prompt is required"}), 400
+        
+    encoded_prompt = urllib.parse.quote(prompt)
+    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
+    
+    return jsonify({
+        "created": int(time.time()),
+        "data": [{"url": image_url}]
+    })
+
+@app.route('/v1/audio/speech', methods=['POST', 'OPTIONS'])
+def proxy_speech():
+    if request.method == 'OPTIONS':
+        return Response(status=200)
+        
+    data = request.json or {}
+    text = data.get("input", "")
+    
+    if not text:
+        return jsonify({"error": "Input text is required"}), 400
+        
+    encoded_text = urllib.parse.quote(text[:200])
+    speech_url = f"http://translate.google.com/translate_tts?ie=UTF-8&total=1&idx=0&client=tw-ob&tl=en&q={encoded_text}"
+    
+    try:
+        r = requests.get(speech_url)
+        if r.status_code == 200:
+            return Response(r.content, mimetype="audio/mpeg")
+        else:
+            return jsonify({"error": "TTS synthesis failed"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/v1/models', methods=['GET', 'OPTIONS'])
 def proxy_models():
