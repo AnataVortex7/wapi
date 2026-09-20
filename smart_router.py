@@ -8,6 +8,8 @@ import base64
 import urllib.parse
 import hashlib
 
+from smart_key_manager import SmartKeyManager, make_request_with_smart_retry
+
 app = Flask(__name__)
 
 # Config loaded from Environment
@@ -45,51 +47,7 @@ if not MODELS:
     MODELS = [{"name": "gemini-1.5-flash", "rpm": 5, "rpd": 20}]
 
 
-# State tracking
-# FIX: key_penalties is now keyed by (key, model_name) instead of just key.
-# Previously, hitting a daily limit on ONE model would block that API key
-# for ALL models until midnight, even models that still had plenty of quota.
-# That was the root cause of the premature "All keys rate-limited" error.
-key_penalties = {}  # (key, model_name) -> timestamp when it was banned (daily limit)
-
-# FIX: short cooldown for transient 429/403 errors (per-minute rate limits,
-# temporary quota blips) that are NOT "per day" limits. Without this, a combo
-# that just failed gets retried again on the very next request immediately,
-# which is what caused 299 "Limits Hit" from only 5 real user requests: every
-# request re-tried every key x every model from the top of the list, hammering
-# Google's API dozens of times per single user message.
-short_cooldowns = {}  # (key, model_name) -> timestamp until which to deprioritize
-SHORT_COOLDOWN_SECONDS = 90
-
-# FIX: real RPM enforcement. Previously rpm/rpd were only ever displayed on
-# the dashboard and never actually used to route traffic, so 100 concurrent
-# users would all hammer the same first few combos in the list regardless of
-# their RPM, instead of being spread across keys/models that still had RPM
-# headroom. request_history tracks a rolling 60s window of call timestamps
-# per (key, model) so we can tell, right now, which combos have room left.
-request_history = {}  # (key, model_name) -> list of call timestamps (last 60s)
-request_history_lock = threading.Lock()
-
-def _prune_and_count(pen_key, now):
-    """Drop timestamps older than 60s and return the remaining count."""
-    hist = request_history.get(pen_key)
-    if not hist:
-        return 0
-    fresh = [ts for ts in hist if now - ts < 60.0]
-    request_history[pen_key] = fresh
-    return len(fresh)
-
-def record_request(key, model_name):
-    now = time.time()
-    with request_history_lock:
-        request_history.setdefault((key, model_name), []).append(now)
-
-def rpm_headroom(key, model_name, rpm_limit):
-    """How many more calls this (key, model) can take in the current 60s window."""
-    now = time.time()
-    with request_history_lock:
-        used = _prune_and_count((key, model_name), now)
-    return max(0, rpm_limit - used)
+# State tracking now handled by SmartKeyManager
 
 
 # Global Metrics
@@ -148,131 +106,7 @@ def get_active_models():
         return DYNAMIC_MODELS if DYNAMIC_MODELS else MODELS
 
 state_lock = threading.Lock()
-current_key_idx = 0
-current_model_idx = 0
-
-def clean_history(history):
-    now = time.time()
-    return [ts for ts in history if now - ts < 60.0]
-
-def get_combo_sequence(is_round_robin):
-    now = time.time()
-    with state_lock:
-        active_models = get_active_models()
-        if not API_KEYS or not active_models:
-            return []
-
-        K = len(API_KEYS)
-        M = len(active_models)
-        start_k = current_key_idx % K
-        start_m = current_model_idx % M
-
-        combos = []
-        cooling = []      # combos on short cooldown from a recent 429/403
-        rpm_full = []     # combos that are at their RPM ceiling right now
-        if is_round_robin:
-            start_idx = start_k * M + start_m
-            for i in range(K * M):
-                idx = (start_idx + i) % (K * M)
-                k_idx = idx // M
-                m_idx = idx % M
-                key = API_KEYS[k_idx]
-                model = active_models[m_idx]
-                pen_key = (key, model['name'])
-
-                # FIX: penalty is checked per (key, model) pair, not per key.
-                # A key that hit its daily limit on one model is still usable
-                # for every other model that still has quota.
-                if pen_key in key_penalties and now < key_penalties[pen_key]:
-                    continue
-
-                combo = (k_idx, m_idx, key, model['name'])
-
-                # FIX: real RPM enforcement. A combo with zero headroom left
-                # in the rolling 60s window is deprioritized (not skipped) so
-                # that with many concurrent users, traffic naturally spreads
-                # across keys/models that still have RPM room instead of
-                # every request piling onto the same first combo in the list.
-                if rpm_headroom(key, model['name'], model.get('rpm', 15)) <= 0:
-                    rpm_full.append(combo)
-                    continue
-
-                # FIX: a combo that failed a moment ago (transient 429/403,
-                # not a daily limit) is pushed to the end of the sequence
-                # instead of being retried again right away. This means a
-                # single user request tries the LAST-KNOWN-GOOD combo first,
-                # and only falls through to recently-failed combos as a last
-                # resort -- instead of hammering every key x model from the
-                # top of the list every single time.
-                cd_until = short_cooldowns.get(pen_key)
-                if cd_until and now < cd_until:
-                    cooling.append(combo)
-                else:
-                    combos.append(combo)
-        else:
-            # Specific model requested. We still need to skip (key, model)
-            # combos that are penalized for THIS model, otherwise a key that
-            # is exhausted just for this one model will be retried pointlessly.
-            for i in range(K):
-                k_idx = (start_k + i) % K
-                key = API_KEYS[k_idx]
-                combo = (k_idx, -1, key, None)
-                # actual_model is resolved by the caller for non-round-robin,
-                # so cooldown/RPM is checked there; just order by recency here.
-                combos.append(combo)
-
-        # Order of preference: fresh combos with RPM room -> combos on a
-        # short cooldown -> combos currently at their RPM ceiling (still
-        # tried as a last resort rather than failing outright, e.g. if
-        # total offered load exceeds total configured RPM capacity).
-        # FIX: when ALL combos are simultaneously at their RPM ceiling,
-        # sorting purely by "closest to recovering" kept picking the exact
-        # same single combo over and over (its oldest call is always the
-        # oldest, every time, until it actually rolls off the window) --
-        # so 100% of the overflow landed on ONE key/model instead of being
-        # shared. We instead rotate the rpm_full order using the existing
-        # round-robin pointer, so repeated overflow is spread evenly across
-        # all saturated combos rather than hammering a single one.
-        if rpm_full:
-            start_idx_for_rr = start_k * M + start_m
-            def sort_key(combo):
-                k_idx, m_idx, _, _ = combo
-                idx = k_idx * M + m_idx
-                # distance forward from the current round-robin pointer
-                return (idx - start_idx_for_rr) % (K * M)
-            rpm_full.sort(key=sort_key)
-
-        return combos + cooling + rpm_full
-
-
-def set_sticky_success(k_idx, m_idx, key=None, model_name=None):
-    global current_key_idx, current_model_idx
-    with state_lock:
-        # FIX: previously this PINNED the pointer to the combo that just
-        # succeeded, so the very next request would try that same combo
-        # first again -- and kept doing so every time it succeeded. Under
-        # concurrent load this meant one (key, model) pair got picked far
-        # more often than its RPM allowed (we saw 45 calls against an RPM
-        # of 5) because "successful" always jumped back to position zero.
-        # Instead we ADVANCE the pointer past the combo just used, so the
-        # next request naturally starts from the next one in line -- true
-        # round-robin fairness, with RPM headroom still deciding order.
-        if k_idx != -1:
-            active_models = get_active_models()
-            M = len(active_models) if active_models else 1
-            if m_idx != -1:
-                # advance to the next (key, model) slot in the K*M grid
-                idx = k_idx * M + m_idx
-                idx = (idx + 1) % (len(API_KEYS) * M) if API_KEYS else 0
-                current_key_idx = idx // M
-                current_model_idx = idx % M
-            else:
-                current_key_idx = (k_idx + 1) % len(API_KEYS) if API_KEYS else 0
-        # FIX: a successful call clears any short cooldown for this exact
-        # combo, so it's trusted again right away instead of waiting out
-        # the cooldown window even though it's clearly working now.
-        if key is not None and model_name is not None:
-            short_cooldowns.pop((key, model_name), None)
+mgr = SmartKeyManager(API_KEYS, get_active_models)
 
 request_logs = deque(maxlen=150)
 
@@ -363,7 +197,7 @@ def api_dashboard_data():
     # FIX: key is now a (key, model) tuple, format it accordingly.
     penalized = {
         f"{k[0][:5]}...{k[0][-5:]} [{k[1]}]": round((ts - now) / 60, 1)
-        for k, ts in key_penalties.items()
+        for k, ts in mgr.key_penalties.items()
     }
     return jsonify({
         "metrics": metrics,
@@ -657,118 +491,41 @@ def proxy_chat():
     data.pop('user', None)
 
     requested_model = data.get("model", "")
-
-    # Fetch ALL valid combos based on Round-Robin or Specific Model
-    is_round_robin = requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model", ""]
-    combos = get_combo_sequence(is_round_robin)
-
-    last_resp = None
-
-    for k_idx, m_idx, key, rr_model_name in combos:
-        actual_model = rr_model_name if is_round_robin else requested_model
-
-        # FIX: for a specifically-requested (non round-robin) model, skip this
-        # (key, model) combo if it is currently penalized for THAT model.
-        if not is_round_robin:
-            now = time.time()
-            pen_key = (key, actual_model)
-            with state_lock:
-                penalized_until = key_penalties.get(pen_key)
-            if penalized_until and now < penalized_until:
-                continue
-
+    
+    def call_fn(key, actual_model):
         data["model"] = actual_model
-
         headers = {
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json"
         }
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        return requests.post(url, json=data, headers=headers, stream=True)
 
-        try:
-            # FIX: record this attempt in the rolling 60s RPM window BEFORE
-            # making the call, so RPM enforcement reflects actual traffic
-            # (including attempts that end up failing) not just successes.
-            record_request(key, actual_model)
-            resp = requests.post(url, json=data, headers=headers, stream=True)
-            last_resp = resp
-
-            if resp.status_code == 200:
-                set_sticky_success(k_idx, m_idx, key, actual_model)
-                if hasattr(g, "log_entry"): g.log_entry["status"] = f"200 Success ({actual_model})"
-                with state_lock:
-                    metrics["successful_api_calls"] += 1
-                    safe_key = key[:5] + "..." + key[-5:]
-                    if safe_key not in metrics["usage_by_key"]:
-                        metrics["usage_by_key"][safe_key] = {}
-                    if actual_model not in metrics["usage_by_key"][safe_key]:
-                        metrics["usage_by_key"][safe_key][actual_model] = 0
-                    metrics["usage_by_key"][safe_key][actual_model] += 1
-
-                excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-                out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
-                               if name.lower() not in excluded_headers]
-                return Response(resp.content, resp.status_code, out_headers)
-
-            elif resp.status_code in [429, 403]:
-                error_text = resp.text.lower() if hasattr(resp, 'text') else ""
-
-                if "per day" in error_text:
-                    import datetime
-                    now_utc = datetime.datetime.utcnow()
-                    ist_offset = datetime.timedelta(hours=5, minutes=30)
-                    now_ist = now_utc + ist_offset
-                    next_midnight_ist = datetime.datetime(now_ist.year, now_ist.month, now_ist.day) + datetime.timedelta(days=1)
-                    next_midnight_utc = next_midnight_ist - ist_offset
-                    unlock_time = next_midnight_utc.timestamp()
-
-                    # FIX: penalize only this (key, model) pair, not the whole key.
-                    print(f"Key {key[:5]}... hit DAILY LIMIT for model {actual_model}. Penalized (this model only) until Midnight IST.")
-                    with state_lock:
-                        key_penalties[(key, actual_model)] = unlock_time
-                        metrics["rate_limit_hits"] += 1
-                else:
-                    # FIX: short cooldown (not a full ban) so this combo isn't
-                    # retried again on the very next request. It will be tried
-                    # again later, but after other combos get a chance first.
-                    print(f"Key {key[:5]}... hit 429/403 limit on {actual_model}. Cooling down {SHORT_COOLDOWN_SECONDS}s, trying next combo.")
-                    with state_lock:
-                        short_cooldowns[(key, actual_model)] = time.time() + SHORT_COOLDOWN_SECONDS
-                        metrics["rate_limit_hits"] += 1
-                continue
-
-            elif resp.status_code in [500, 503]:
-                print(f"Model {actual_model} error ({resp.status_code}). Trying next combo...")
-                continue
-
-            elif resp.status_code in [404, 400]:
-                print(f"Model {actual_model} error ({resp.status_code}). Removing from active lists permanently.")
-                with dynamic_models_lock:
-                    global DYNAMIC_MODELS, OPENAI_MODELS_LIST
-                    DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
-                    OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
-                continue
-
-            else:
-                # Other responses (e.g. 401 Unauthorized), just return them
-                with state_lock:
-                    metrics["failed_requests"] += 1
-                excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-                out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
-                               if name.lower() not in excluded_headers]
-                return Response(resp.content, resp.status_code, out_headers)
-
-        except Exception as e:
-            print(f"API call error: {e}")
-            continue
-
-    if last_resp is not None:
-        with state_lock:
-            metrics["failed_requests"] += 1
+    resp, key, actual_model = make_request_with_smart_retry(mgr, call_fn, requested_model)
+    
+    if resp is not None:
+        if resp.status_code == 200:
+            if hasattr(g, "log_entry"): g.log_entry["status"] = f"200 Success ({actual_model})"
+            with state_lock:
+                metrics["successful_api_calls"] += 1
+                safe_key = key[:5] + "..." + key[-5:]
+                if safe_key not in metrics["usage_by_key"]:
+                    metrics["usage_by_key"][safe_key] = {}
+                if actual_model not in metrics["usage_by_key"][safe_key]:
+                    metrics["usage_by_key"][safe_key][actual_model] = 0
+                metrics["usage_by_key"][safe_key][actual_model] += 1
+        elif resp.status_code in [429, 403]:
+            with state_lock:
+                metrics["rate_limit_hits"] += 1
+                metrics["failed_requests"] += 1
+        else:
+            with state_lock:
+                metrics["failed_requests"] += 1
+            
         excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-        out_headers = [(name, value) for (name, value) in last_resp.raw.headers.items()
+        out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
                        if name.lower() not in excluded_headers]
-        return Response(last_resp.content, last_resp.status_code, out_headers)
+        return Response(resp.content, resp.status_code, out_headers)
 
     return jsonify({"error": {"message": "All API keys are currently rate-limited (429) or exhausted. Please wait 1 minute.", "type": "rate_limit_error"}}), 429
 
@@ -795,36 +552,28 @@ def proxy_transcriptions():
         "generationConfig": {"temperature": 0.0}
     }
 
-    combos = get_combo_sequence(False)
-    last_resp = None
-
-    for k_idx, m_idx, key, _ in combos:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+    def call_fn(key, actual_model):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{actual_model}:generateContent?key={key}"
         headers = {"Content-Type": "application/json"}
-        try:
-            resp = requests.post(url, headers=headers, json=data)
-            last_resp = resp
-            if resp.status_code == 200:
-                set_sticky_success(k_idx, -1)
-                with state_lock:
-                    metrics["successful_api_calls"] += 1
-                result = resp.json()
-                try:
-                    text = result['candidates'][0]['content']['parts'][0]['text']
-                    return jsonify({"text": text.strip()})
-                except KeyError:
-                    return jsonify({"error": "Failed to parse transcription"}), 500
-            elif resp.status_code in [429, 403]:
-                with state_lock:
-                    metrics["rate_limit_hits"] += 1
-                continue
-            else:
-                return Response(resp.content, resp.status_code)
-        except Exception as e:
-            continue
+        return requests.post(url, headers=headers, json=data)
 
-    if last_resp is not None:
-        return Response(last_resp.content, last_resp.status_code)
+    resp, key, actual_model = make_request_with_smart_retry(mgr, call_fn, "gemini-1.5-flash")
+    
+    if resp is not None:
+        if resp.status_code == 200:
+            with state_lock:
+                metrics["successful_api_calls"] += 1
+            result = resp.json()
+            try:
+                text = result['candidates'][0]['content']['parts'][0]['text']
+                return jsonify({"text": text.strip()})
+            except KeyError:
+                return jsonify({"error": "Failed to parse transcription"}), 500
+        elif resp.status_code in [429, 403]:
+            with state_lock:
+                metrics["rate_limit_hits"] += 1
+        
+        return Response(resp.content, resp.status_code)
 
     return jsonify({"error": {"message": "All API keys are currently rate-limited (429) or exhausted.", "type": "rate_limit"}}), 429
 
@@ -877,7 +626,7 @@ def get_status():
     # FIX: key is now a (key, model) tuple, format it accordingly.
     penalized = {
         f"{k[0][:5]}...{k[0][-5:]} [{k[1]}]": round((ts - now) / 60, 1)
-        for k, ts in key_penalties.items()
+        for k, ts in mgr.key_penalties.items()
     }  # minutes left
     return jsonify({
         "metrics": metrics,
