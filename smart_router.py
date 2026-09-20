@@ -102,48 +102,50 @@ def clean_history(history):
     now = time.time()
     return [ts for ts in history if now - ts < 60.0]
 
-def get_next_available_combo():
-    global current_key_idx, current_model_idx
+def get_combo_sequence(is_round_robin):
     now = time.time()
-    
     with state_lock:
         active_models = get_active_models()
         if not API_KEYS or not active_models:
-            return None, None
+            return []
+            
+        K = len(API_KEYS)
+        M = len(active_models)
         
-        total_combos = len(API_KEYS) * len(active_models)
-        for _ in range(total_combos):
-            # Dynamic bounds safety check
-            current_key_idx = current_key_idx % len(API_KEYS)
-            current_model_idx = current_model_idx % len(active_models)
-            
-            key = API_KEYS[current_key_idx]
-            model = active_models[current_model_idx]
-            
-            # Advance pointers
-            current_model_idx += 1
-            if current_model_idx >= len(active_models):
-                current_model_idx = 0
-                current_key_idx = (current_key_idx + 1) % len(API_KEYS)
-            
-            # Check variable penalty
-            if key in key_penalties:
-                if now < key_penalties[key]:
-                    continue
-                else:
-                    del key_penalties[key]
-                    
-            # Check RPM limit
-            combo_id = f"{key}_{model['name']}"
-            history = request_history.get(combo_id, [])
-            history = clean_history(history)
-            request_history[combo_id] = history
-            
-            if len(history) < model['rpm']:
-                history.append(now)
-                return key, model['name']
+        start_k = current_key_idx % K
+        start_m = current_model_idx % M
+        
+        combos = []
+        if is_round_robin:
+            start_idx = start_k * M + start_m
+            for i in range(K * M):
+                idx = (start_idx + i) % (K * M)
+                k_idx = idx // M
+                m_idx = idx % M
+                key = API_KEYS[k_idx]
+                model = active_models[m_idx]
                 
-        return None, None
+                if key in key_penalties and now < key_penalties[key]:
+                    continue
+                    
+                combos.append((k_idx, m_idx, key, model['name']))
+        else:
+            for i in range(K):
+                k_idx = (start_k + i) % K
+                key = API_KEYS[k_idx]
+                if key in key_penalties and now < key_penalties[key]:
+                    continue
+                combos.append((k_idx, -1, key, None))
+                
+        return combos
+
+def set_sticky_success(k_idx, m_idx):
+    global current_key_idx, current_model_idx
+    with state_lock:
+        if k_idx != -1:
+            current_key_idx = k_idx
+        if m_idx != -1:
+            current_model_idx = m_idx
 
 request_logs = deque(maxlen=150)
 
@@ -548,34 +550,16 @@ def proxy_chat():
     data = request.json or {}
     requested_model = data.get("model", "")
     
-    # Try Real APIs across all keys and models
-    attempts = 0
+    # Fetch ALL valid combos based on Round-Robin or Specific Model
+    is_round_robin = requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model", ""]
+    combos = get_combo_sequence(is_round_robin)
+    
     last_resp = None
     
-    # We will track which keys have been tried for specific models to avoid spamming
-    tried_keys = set()
-    is_round_robin = requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model", ""]
-    
-    max_retries = len(API_KEYS) * len(get_active_models()) if (API_KEYS and get_active_models() and is_round_robin) else (len(API_KEYS) if API_KEYS else 0)
-    
-    while attempts < max_retries:
-        key, rr_model_name = get_next_available_combo()
-        if not key:
-            break
-            
-        attempts += 1
-        
-        # If user asked for gemini-pro/auto, do full round-robin. Else use their specific model.
-        if is_round_robin:
-            actual_model = rr_model_name
-        else:
-            actual_model = requested_model
-            # Avoid trying the same key multiple times for the exact same specific model
-            if key in tried_keys:
-                continue
-            tried_keys.add(key)
-            
+    for k_idx, m_idx, key, rr_model_name in combos:
+        actual_model = rr_model_name if is_round_robin else requested_model
         data["model"] = actual_model
+        
         headers = {
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json"
@@ -587,6 +571,7 @@ def proxy_chat():
             last_resp = resp
             
             if resp.status_code == 200:
+                set_sticky_success(k_idx, m_idx) # Save this success so next request starts exactly here!
                 with state_lock:
                     metrics["successful_api_calls"] += 1
                     safe_key = key[:5] + "..." + key[-5:]
@@ -602,20 +587,8 @@ def proxy_chat():
                 return Response(resp.content, resp.status_code, out_headers)
                 
             elif resp.status_code in [429, 403]:
-                error_text = resp.text.lower()
-                
-                # १. जर 403 (Safety/Permission Issue) असेल, तर इतर keys block करू नका. 
-                if resp.status_code == 403:
-                    print(f"Key {key[:5]}...{key[-5:]} hit 403 Forbidden. Stopping retries.")
-                    with state_lock:
-                        metrics["failed_requests"] += 1
-                    excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-                    out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
-                                   if name.lower() not in excluded_headers]
-                    return Response(resp.content, resp.status_code, out_headers)
-
+                error_text = resp.text.lower() if hasattr(resp, 'text') else ""
                 if "per day" in error_text:
-                    # Only block until midnight IST if strictly daily quota
                     import datetime
                     now_utc = datetime.datetime.utcnow()
                     ist_offset = datetime.timedelta(hours=5, minutes=30)
@@ -624,31 +597,29 @@ def proxy_chat():
                     next_midnight_utc = next_midnight_ist - ist_offset
                     unlock_time = next_midnight_utc.timestamp()
                     print(f"Key {key[:5]}... hit DAILY LIMIT. Penalized until Midnight IST.")
+                    with state_lock:
+                        key_penalties[key] = unlock_time
+                        metrics["rate_limit_hits"] += 1
                 else:
-                    # Regular RPM limit or other 429/403 -> block for 60 seconds
-                    unlock_time = time.time() + 60
-                    print(f"Key {key[:5]}... hit RPM/403. Penalized for 60s.")
-                    
-                with state_lock:
-                    key_penalties[key] = unlock_time
-                    metrics["rate_limit_hits"] += 1
-                    
+                    print(f"Key {key[:5]}... hit 429/403 limit. Skipping to next combo (NO PENALTY).")
+                    with state_lock:
+                        metrics["rate_limit_hits"] += 1
                 continue
                 
             elif resp.status_code in [500, 503]:
-                # Overload/500/503: Do NOT penalize or block keys. Try next combo.
-                print(f"Model {actual_model} error ({resp.status_code}). Trying next combo without blocking key...")
+                print(f"Model {actual_model} error ({resp.status_code}). Trying next combo...")
                 continue
+                
             elif resp.status_code in [404, 400]:
                 print(f"Model {actual_model} error ({resp.status_code}). Removing from active lists permanently.")
                 with dynamic_models_lock:
                     global DYNAMIC_MODELS, OPENAI_MODELS_LIST
                     DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
                     OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
-                max_retries += 1  # Give a free retry
                 continue
+                
             else:
-                # Other non-200 responses
+                # Other responses (e.g. 401 Unauthorized), just return them
                 with state_lock:
                     metrics["failed_requests"] += 1
                 excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
@@ -660,7 +631,6 @@ def proxy_chat():
             print(f"API call error: {e}")
             continue
             
-    # If all API key and model combos failed (e.g. all returned 500 or overload), return last response instead of blocking/failing wrongly
     if last_resp is not None:
         with state_lock:
             metrics["failed_requests"] += 1
@@ -675,41 +645,37 @@ def proxy_chat():
 def proxy_transcriptions():
     if request.method == 'OPTIONS':
         return Response(status=200)
-
     if 'file' not in request.files:
-        return jsonify({"error": "No file provided"}), 400
+        return jsonify({"error": "No file uploaded"}), 400
         
-    audio_file = request.files['file']
-    audio_data = base64.b64encode(audio_file.read()).decode("utf-8")
-    mime_type = audio_file.content_type or "audio/ogg"
-
-    max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
-    attempts = 0
-
-    while attempts < max_retries:
-        key, model_name = get_next_available_combo()
-        if not key:
-            break
-        attempts += 1
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"text": "Transcribe this audio. Output ONLY the exact text spoken, nothing else."},
-                    {
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": audio_data
-                        }
-                    }
-                ]
-            }]
-        }
-        
+    file = request.files['file']
+    audio_bytes = file.read()
+    b64_audio = base64.b64encode(audio_bytes).decode('utf-8')
+    mime_type = file.content_type or "audio/wav"
+    
+    data = {
+        "contents": [{
+            "parts": [
+                {"inlineData": {"mimeType": mime_type, "data": b64_audio}},
+                {"text": "Transcribe the following audio accurately."}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.0}
+    }
+    
+    combos = get_combo_sequence(False)
+    last_resp = None
+    
+    for k_idx, m_idx, key, _ in combos:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+        headers = {"Content-Type": "application/json"}
         try:
-            resp = requests.post(url, headers={"Content-Type": "application/json"}, json=payload)
+            resp = requests.post(url, headers=headers, json=data)
+            last_resp = resp
             if resp.status_code == 200:
+                set_sticky_success(k_idx, -1)
+                with state_lock:
+                    metrics["successful_api_calls"] += 1
                 result = resp.json()
                 try:
                     text = result['candidates'][0]['content']['parts'][0]['text']
@@ -718,172 +684,16 @@ def proxy_transcriptions():
                     return jsonify({"error": "Failed to parse transcription"}), 500
             elif resp.status_code in [429, 403]:
                 with state_lock:
-                    key_penalties[key] = time.time() + 120
-                    metrics["rate_limit_hits"] += 1
-                continue
-            else:
-                return Response(resp.content, resp.status_code)
-                
-        except Exception as e:
-            print(f"Transcription error: {e}")
-            continue
-
-    return jsonify({"error": {"message": "All API keys are currently rate-limited (429) or exhausted.", "type": "rate_limit"}}), 429
-
-@app.route('/v1/embeddings', methods=['POST', 'OPTIONS'])
-def proxy_embeddings():
-    if request.method == 'OPTIONS':
-        return Response(status=200)
-    
-    data = request.json or {}
-    data['model'] = 'gemini-embedding-2' # Force standard embedding model
-    
-    max_retries = len(API_KEYS) if API_KEYS else 0
-    attempts = 0
-
-    while attempts < max_retries:
-        key, _ = get_next_available_combo()
-        if not key:
-            break
-        attempts += 1
-        
-        url = "https://generativelanguage.googleapis.com/v1beta/openai/embeddings"
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        
-        try:
-            resp = requests.post(url, headers=headers, json=data)
-            if resp.status_code == 200:
-                with state_lock:
-                    metrics["successful_api_calls"] += 1
-                return jsonify(resp.json())
-            elif resp.status_code in [429, 403]:
-                with state_lock:
-                    key_penalties[key] = time.time() + 120
                     metrics["rate_limit_hits"] += 1
                 continue
             else:
                 return Response(resp.content, resp.status_code)
         except Exception as e:
-            print(f"Embedding error: {e}")
             continue
             
+    if last_resp is not None:
+        return Response(last_resp.content, last_resp.status_code)
     return jsonify({"error": {"message": "All API keys are currently rate-limited (429) or exhausted.", "type": "rate_limit"}}), 429
-
-@app.route('/v1/completions', methods=['POST', 'OPTIONS'])
-def proxy_completions():
-    if request.method == 'OPTIONS':
-        return Response(status=200)
-    
-    data = request.json or {}
-    prompt = data.get("prompt", "")
-    if isinstance(prompt, list):
-        prompt = prompt[0] if prompt else ""
-        
-    requested_model = data.get("model", "")
-    chat_data = {
-        "model": requested_model or "gemini-1.5-flash",
-        "messages": [{"role": "user", "content": str(prompt)}]
-    }
-    
-    is_round_robin = requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model", ""]
-    max_retries = len(API_KEYS) * len(get_active_models()) if (API_KEYS and get_active_models() and is_round_robin) else (len(API_KEYS) if API_KEYS else 0)
-    attempts = 0
-    tried_keys = set()
-
-    while attempts < max_retries:
-        key, rr_model_name = get_next_available_combo()
-        if not key:
-            break
-        attempts += 1
-        
-        if is_round_robin:
-            actual_model = rr_model_name
-        else:
-            actual_model = requested_model
-            if key in tried_keys:
-                continue
-            tried_keys.add(key)
-            
-        chat_data["model"] = actual_model
-        
-        url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        
-        try:
-            resp = requests.post(url, headers=headers, json=chat_data)
-            if resp.status_code == 200:
-                with state_lock:
-                    metrics["successful_api_calls"] += 1
-                
-                chat_resp = resp.json()
-                try:
-                    text = chat_resp["choices"][0]["message"]["content"]
-                    return jsonify({
-                        "id": chat_resp.get("id", "cmpl-dummy"),
-                        "object": "text_completion",
-                        "created": chat_resp.get("created", int(time.time())),
-                        "model": actual_model,
-                        "choices": [
-                            {"text": text, "index": 0, "finish_reason": "stop"}
-                        ],
-                        "usage": chat_resp.get("usage", {})
-                    })
-                except KeyError:
-                    return jsonify(chat_resp)
-            elif resp.status_code in [429, 403]:
-                with state_lock:
-                    key_penalties[key] = time.time() + 120
-                    metrics["rate_limit_hits"] += 1
-                continue
-            else:
-                return Response(resp.content, resp.status_code)
-        except Exception as e:
-            print(f"Completions error: {e}")
-            continue
-            
-    return jsonify({"error": {"message": "All API keys are currently rate-limited (429) or exhausted.", "type": "rate_limit"}}), 429
-
-@app.route('/v1/images/generations', methods=['POST', 'OPTIONS'])
-def proxy_images():
-    if request.method == 'OPTIONS':
-        return Response(status=200)
-    
-    data = request.json or {}
-    prompt = data.get("prompt", "")
-    
-    if not prompt:
-        return jsonify({"error": "Prompt is required"}), 400
-        
-    encoded_prompt = urllib.parse.quote(prompt)
-    image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
-    
-    return jsonify({
-        "created": int(time.time()),
-        "data": [{"url": image_url}]
-    })
-
-@app.route('/v1/audio/speech', methods=['POST', 'OPTIONS'])
-def proxy_speech():
-    if request.method == 'OPTIONS':
-        return Response(status=200)
-        
-    data = request.json or {}
-    text = data.get("input", "")
-    
-    if not text:
-        return jsonify({"error": "Input text is required"}), 400
-        
-    encoded_text = urllib.parse.quote(text[:200])
-    speech_url = f"http://translate.google.com/translate_tts?ie=UTF-8&total=1&idx=0&client=tw-ob&tl=en&q={encoded_text}"
-    
-    try:
-        r = requests.get(speech_url)
-        if r.status_code == 200:
-            return Response(r.content, mimetype="audio/mpeg")
-        else:
-            return jsonify({"error": "TTS synthesis failed"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 @app.route('/v1/models', methods=['GET', 'OPTIONS'])
 def proxy_models():
