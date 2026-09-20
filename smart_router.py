@@ -548,6 +548,8 @@ def proxy_chat():
         metrics["total_incoming_requests"] += 1
         
     data = request.json or {}
+    data.pop('session_id', None)
+    data.pop('user', None)
     requested_model = data.get("model", "")
     
     # Fetch ALL valid combos based on Round-Robin or Specific Model
