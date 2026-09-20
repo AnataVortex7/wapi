@@ -53,35 +53,40 @@ def refresh_models_loop():
     global DYNAMIC_MODELS, OPENAI_MODELS_LIST
     while True:
         if API_KEYS:
-            try:
-                key = API_KEYS[0]
-                url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
-                resp = requests.get(url, timeout=10)
-                if resp.status_code == 200:
-                    data = resp.json().get("models", [])
-                    new_rr = []
-                    new_openai = []
-                    now = int(time.time())
-                    for m in data:
-                        name = m["name"].replace("models/", "")
-                        new_openai.append({"id": name, "object": "model", "created": now, "owned_by": "google"})
-                        methods = m.get("supportedGenerationMethods", [])
-                        if "generateContent" in methods and "vision" not in name.lower() and "embedding" not in name.lower():
-                            rpm = 1500 if "flash" in name.lower() else 15
-                            rpd = 1500 if "flash" in name.lower() else 50
-                            new_rr.append({"name": name, "rpm": rpm, "rpd": rpd})
+            for key in API_KEYS:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+                    resp = requests.get(url, timeout=10)
+                    if resp.status_code == 200:
+                        data = resp.json().get("models", [])
+                        new_rr = []
+                        new_openai = []
+                        now = int(time.time())
+                        for m in data:
+                            name = m["name"].replace("models/", "")
+                            new_openai.append({"id": name, "object": "model", "created": now, "owned_by": "google"})
+                            methods = m.get("supportedGenerationMethods", [])
+                            if "generateContent" in methods and "vision" not in name.lower() and "embedding" not in name.lower() and "preview" not in name.lower() and not name.startswith("gemini-2.5"):
+                                rpm = 1500 if "flash" in name.lower() else 15
+                                rpd = 1500 if "flash" in name.lower() else 50
+                                new_rr.append({"name": name, "rpm": rpm, "rpd": rpd})
+                        
+                        for extra in ["dall-e-3", "whisper-1", "tts-1"]:
+                            if not any(x["id"] == extra for x in new_openai):
+                                new_openai.append({"id": extra, "object": "model", "created": now, "owned_by": "google"})
+                                
+                        with dynamic_models_lock:
+                            if new_rr:
+                                DYNAMIC_MODELS = new_rr
+                            OPENAI_MODELS_LIST = new_openai
+                        break
+                except Exception as e:
+                    print(f"Model refresh error: {e}")
                     
-                    for extra in ["dall-e-3", "whisper-1", "tts-1"]:
-                        if not any(x["id"] == extra for x in new_openai):
-                            new_openai.append({"id": extra, "object": "model", "created": now, "owned_by": "google"})
-                            
-                    with dynamic_models_lock:
-                        if new_rr:
-                            DYNAMIC_MODELS = new_rr
-                        OPENAI_MODELS_LIST = new_openai
-            except Exception as e:
-                print(f"Model refresh error: {e}")
-        time.sleep(86400) # Refresh every hour
+        if not DYNAMIC_MODELS:
+            time.sleep(60)
+        else:
+            time.sleep(86400)
 
 threading.Thread(target=refresh_models_loop, daemon=True).start()
 
@@ -115,11 +120,11 @@ def get_next_available_combo():
             key = API_KEYS[current_key_idx]
             model = active_models[current_model_idx]
             
-            # Advance pointers: Cycle KEYS first, then MODELS!
-            current_key_idx += 1
-            if current_key_idx >= len(API_KEYS):
-                current_key_idx = 0
-                current_model_idx = (current_model_idx + 1) % len(active_models)
+            # Advance pointers
+            current_model_idx += 1
+            if current_model_idx >= len(active_models):
+                current_model_idx = 0
+                current_key_idx = (current_key_idx + 1) % len(API_KEYS)
             
             # Check variable penalty
             if key in key_penalties:
@@ -551,11 +556,8 @@ def proxy_chat():
     tried_keys = set()
     is_round_robin = requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model", ""]
     
-    if is_round_robin:
-        max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
-    else:
-        max_retries = len(API_KEYS) if API_KEYS else 0
-        
+    max_retries = len(API_KEYS) * len(get_active_models()) if (API_KEYS and get_active_models() and is_round_robin) else (len(API_KEYS) if API_KEYS else 0)
+    
     while attempts < max_retries:
         key, rr_model_name = get_next_available_combo()
         if not key:
@@ -632,16 +634,9 @@ def proxy_chat():
                     
                 continue
                 
-            elif resp.status_code in [500, 503]:
-                # Overload/500/503: Do NOT penalize or block keys. Try next combo.
+            elif resp.status_code in [500, 503, 404]:
+                # Overload/500/503/404: Do NOT penalize or block keys. Try next combo.
                 print(f"Model {actual_model} error ({resp.status_code}). Trying next combo without blocking key...")
-                continue
-            elif resp.status_code in [404, 400]:
-                print(f"Model {actual_model} is DEAD/DEPRECATED ({resp.status_code}). Removing from active lists permanently.")
-                with dynamic_models_lock:
-                    global DYNAMIC_MODELS, OPENAI_MODELS_LIST
-                    DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
-                    OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
                 continue
             else:
                 # Other non-200 responses
@@ -679,7 +674,7 @@ def proxy_transcriptions():
     audio_data = base64.b64encode(audio_file.read()).decode("utf-8")
     mime_type = audio_file.content_type or "audio/ogg"
 
-    max_retries = min(len(API_KEYS) * 2, 10) if API_KEYS else 0
+    max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
     attempts = 0
 
     while attempts < max_retries:
@@ -782,12 +777,7 @@ def proxy_completions():
     }
     
     is_round_robin = requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model", ""]
-    
-    if is_round_robin:
-        max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
-    else:
-        max_retries = len(API_KEYS) if API_KEYS else 0
-        
+    max_retries = len(API_KEYS) * len(get_active_models()) if (API_KEYS and get_active_models() and is_round_robin) else (len(API_KEYS) if API_KEYS else 0)
     attempts = 0
     tried_keys = set()
 
