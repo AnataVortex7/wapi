@@ -4,6 +4,7 @@ from flask import Flask, request, jsonify, Response, render_template_string, g
 from functools import wraps
 from collections import deque
 import requests
+import base64
 
 import hashlib
 
@@ -495,12 +496,6 @@ def proxy_chat():
         
     data = request.json or {}
     
-    # Remove unsupported OpenAI parameters that cause Gemini to throw errors
-    unsupported_keys = ["presence_penalty", "frequency_penalty", "logit_bias", "logprobs", "top_logprobs", "user", "seed"]
-    for k in unsupported_keys:
-        if k in data:
-            del data[k]
-            
     # Try Real APIs across all keys and models
     max_retries = len(API_KEYS) * len(MODELS) if API_KEYS and MODELS else 0
     attempts = 0
@@ -607,6 +602,69 @@ def proxy_chat():
         return Response(last_resp.content, last_resp.status_code, out_headers)
         
     return jsonify({"error": {"message": "All API keys and models failed.", "type": "server_error"}}), 500
+
+@app.route('/v1/audio/transcriptions', methods=['POST', 'OPTIONS'])
+def proxy_transcriptions():
+    if request.method == 'OPTIONS':
+        return Response(status=200)
+
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+        
+    audio_file = request.files['file']
+    audio_data = base64.b64encode(audio_file.read()).decode("utf-8")
+    mime_type = audio_file.content_type or "audio/ogg"
+
+    max_retries = len(API_KEYS) * len(MODELS) if API_KEYS and MODELS else 0
+    attempts = 0
+
+    while attempts < max_retries:
+        key, model_name = get_next_available_combo()
+        if not key:
+            break
+        attempts += 1
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": "Transcribe this audio. Output ONLY the exact text spoken, nothing else."},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": audio_data
+                        }
+                    }
+                ]
+            }]
+        }
+        
+        try:
+            resp = requests.post(url, headers={"Content-Type": "application/json"}, json=payload)
+            if resp.status_code == 200:
+                result = resp.json()
+                try:
+                    text = result['candidates'][0]['content']['parts'][0]['text']
+                    return jsonify({"text": text.strip()})
+                except KeyError:
+                    return jsonify({"error": "Failed to parse transcription"}), 500
+            elif resp.status_code in [429, 403]:
+                with state_lock:
+                    key_penalties[key] = time.time() + 120
+                    metrics["rate_limit_hits"] += 1
+                if attempts >= 1:
+                    return jsonify({"error": "Rate limit or Forbidden"}), resp.status_code
+                continue
+            elif resp.status_code in [500, 503]:
+                continue
+            else:
+                return Response(resp.content, resp.status_code)
+                
+        except Exception as e:
+            print(f"Transcription error: {e}")
+            continue
+
+    return jsonify({"error": "All APIs failed for transcription."}), 500
 
 @app.route('/v1/models', methods=['GET', 'OPTIONS'])
 def proxy_models():
