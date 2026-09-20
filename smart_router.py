@@ -496,6 +496,7 @@ def proxy_chat():
         metrics["total_incoming_requests"] += 1
         
     data = request.json or {}
+    requested_model = data.get("model", "")
     
     # Try Real APIs across all keys and models
     max_retries = len(API_KEYS) * len(MODELS) if API_KEYS and MODELS else 0
@@ -503,13 +504,19 @@ def proxy_chat():
     last_resp = None
     
     while attempts < max_retries:
-        key, model_name = get_next_available_combo()
+        key, rr_model_name = get_next_available_combo()
         if not key:
             break
             
         attempts += 1
+        
+        # If user asked for gemini-pro/auto, do full round-robin. Else use their specific model.
+        if requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model"]:
+            actual_model = rr_model_name
+        else:
+            actual_model = requested_model if requested_model else rr_model_name
             
-        data["model"] = model_name
+        data["model"] = actual_model
         headers = {
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json"
@@ -526,9 +533,9 @@ def proxy_chat():
                     safe_key = key[:5] + "..." + key[-5:]
                     if safe_key not in metrics["usage_by_key"]:
                         metrics["usage_by_key"][safe_key] = {}
-                    if model_name not in metrics["usage_by_key"][safe_key]:
-                        metrics["usage_by_key"][safe_key][model_name] = 0
-                    metrics["usage_by_key"][safe_key][model_name] += 1
+                    if actual_model not in metrics["usage_by_key"][safe_key]:
+                        metrics["usage_by_key"][safe_key][actual_model] = 0
+                    metrics["usage_by_key"][safe_key][actual_model] += 1
                     
                 excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
                 out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
@@ -578,7 +585,7 @@ def proxy_chat():
                 
             elif resp.status_code in [500, 503]:
                 # Overload/500/503: Do NOT penalize or block keys. Try next combo.
-                print(f"Model {model_name} overloaded (500/503). Trying next combo without blocking key...")
+                print(f"Model {actual_model} overloaded (500/503). Trying next combo without blocking key...")
                 continue
             else:
                 # Other non-200 responses
@@ -720,8 +727,9 @@ def proxy_completions():
     if isinstance(prompt, list):
         prompt = prompt[0] if prompt else ""
         
+    requested_model = data.get("model", "")
     chat_data = {
-        "model": data.get("model", "gemini-1.5-flash"),
+        "model": requested_model or "gemini-1.5-flash",
         "messages": [{"role": "user", "content": str(prompt)}]
     }
     
@@ -729,11 +737,17 @@ def proxy_completions():
     attempts = 0
 
     while attempts < max_retries:
-        key, model_name = get_next_available_combo()
+        key, rr_model_name = get_next_available_combo()
         if not key:
             break
         attempts += 1
-        chat_data["model"] = model_name
+        
+        if requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model"]:
+            actual_model = rr_model_name
+        else:
+            actual_model = requested_model if requested_model else rr_model_name
+            
+        chat_data["model"] = actual_model
         
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
@@ -751,7 +765,7 @@ def proxy_completions():
                         "id": chat_resp.get("id", "cmpl-dummy"),
                         "object": "text_completion",
                         "created": chat_resp.get("created", int(time.time())),
-                        "model": model_name,
+                        "model": actual_model,
                         "choices": [
                             {"text": text, "index": 0, "finish_reason": "stop"}
                         ],
@@ -822,7 +836,24 @@ def proxy_speech():
 def proxy_models():
     if request.method == 'OPTIONS':
         return Response(status=200)
-    # Dummy models response to keep Hermes happy if it probes the endpoint
+        
+    key = API_KEYS[0] if API_KEYS else None
+    if not key:
+        return jsonify({"object": "list", "data": [{"id": "gemini-1.5-flash", "object": "model", "created": int(time.time()), "owned_by": "google"}]})
+        
+    url = "https://generativelanguage.googleapis.com/v1beta/openai/models"
+    headers = {"Authorization": f"Bearer {key}"}
+    
+    try:
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 200:
+            excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+            out_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
+            return Response(resp.content, resp.status_code, out_headers)
+    except Exception as e:
+        print(f"Models error: {e}")
+        
+    # Fallback to dummy
     return jsonify({
         "object": "list",
         "data": [{"id": "gemini-1.5-flash", "object": "model", "created": int(time.time()), "owned_by": "google"}]
@@ -854,4 +885,5 @@ def get_status():
     })
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=8085)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
