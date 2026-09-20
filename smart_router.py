@@ -45,6 +45,50 @@ metrics = {
     "usage_by_key": {}
 }
 
+dynamic_models_lock = threading.Lock()
+DYNAMIC_MODELS = []
+OPENAI_MODELS_LIST = []
+
+def refresh_models_loop():
+    global DYNAMIC_MODELS, OPENAI_MODELS_LIST
+    while True:
+        if API_KEYS:
+            try:
+                key = API_KEYS[0]
+                url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
+                resp = requests.get(url, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json().get("models", [])
+                    new_rr = []
+                    new_openai = []
+                    now = int(time.time())
+                    for m in data:
+                        name = m["name"].replace("models/", "")
+                        new_openai.append({"id": name, "object": "model", "created": now, "owned_by": "google"})
+                        methods = m.get("supportedGenerationMethods", [])
+                        if "generateContent" in methods and "vision" not in name.lower() and "embedding" not in name.lower():
+                            rpm = 1500 if "flash" in name.lower() else 15
+                            rpd = 1500 if "flash" in name.lower() else 50
+                            new_rr.append({"name": name, "rpm": rpm, "rpd": rpd})
+                    
+                    for extra in ["dall-e-3", "whisper-1", "tts-1"]:
+                        if not any(x["id"] == extra for x in new_openai):
+                            new_openai.append({"id": extra, "object": "model", "created": now, "owned_by": "google"})
+                            
+                    with dynamic_models_lock:
+                        if new_rr:
+                            DYNAMIC_MODELS = new_rr
+                        OPENAI_MODELS_LIST = new_openai
+            except Exception as e:
+                print(f"Model refresh error: {e}")
+        time.sleep(86400) # Refresh every hour
+
+threading.Thread(target=refresh_models_loop, daemon=True).start()
+
+def get_active_models():
+    with dynamic_models_lock:
+        return DYNAMIC_MODELS if DYNAMIC_MODELS else MODELS
+
 state_lock = threading.Lock()
 current_key_idx = 0
 current_model_idx = 0
@@ -58,21 +102,22 @@ def get_next_available_combo():
     now = time.time()
     
     with state_lock:
-        if not API_KEYS or not MODELS:
+        active_models = get_active_models()
+        if not API_KEYS or not active_models:
             return None, None
         
-        total_combos = len(API_KEYS) * len(MODELS)
+        total_combos = len(API_KEYS) * len(active_models)
         for _ in range(total_combos):
             # Dynamic bounds safety check
             current_key_idx = current_key_idx % len(API_KEYS)
-            current_model_idx = current_model_idx % len(MODELS)
+            current_model_idx = current_model_idx % len(active_models)
             
             key = API_KEYS[current_key_idx]
-            model = MODELS[current_model_idx]
+            model = active_models[current_model_idx]
             
             # Advance pointers
             current_model_idx += 1
-            if current_model_idx >= len(MODELS):
+            if current_model_idx >= len(active_models):
                 current_model_idx = 0
                 current_key_idx = (current_key_idx + 1) % len(API_KEYS)
             
@@ -499,7 +544,7 @@ def proxy_chat():
     requested_model = data.get("model", "")
     
     # Try Real APIs across all keys and models
-    max_retries = len(API_KEYS) * len(MODELS) if API_KEYS and MODELS else 0
+    max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
     attempts = 0
     last_resp = None
     
@@ -573,19 +618,11 @@ def proxy_chat():
                     key_penalties[key] = unlock_time
                     metrics["rate_limit_hits"] += 1
                     
-                # जर एकाच request ने 429 error दिला, तर लगेच थांबवा (इतर keys वर ट्राय नको)
-                if attempts >= 1:
-                    print("429 error received. Stopping retries to save other keys.")
-                    excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-                    out_headers = [(name, value) for (name, value) in resp.raw.headers.items()
-                                   if name.lower() not in excluded_headers]
-                    return Response(resp.content, resp.status_code, out_headers)
-                    
                 continue
                 
-            elif resp.status_code in [500, 503]:
-                # Overload/500/503: Do NOT penalize or block keys. Try next combo.
-                print(f"Model {actual_model} overloaded (500/503). Trying next combo without blocking key...")
+            elif resp.status_code in [500, 503, 404]:
+                # Overload/500/503/404: Do NOT penalize or block keys. Try next combo.
+                print(f"Model {actual_model} error ({resp.status_code}). Trying next combo without blocking key...")
                 continue
             else:
                 # Other non-200 responses
@@ -623,7 +660,7 @@ def proxy_transcriptions():
     audio_data = base64.b64encode(audio_file.read()).decode("utf-8")
     mime_type = audio_file.content_type or "audio/ogg"
 
-    max_retries = len(API_KEYS) * len(MODELS) if API_KEYS and MODELS else 0
+    max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
     attempts = 0
 
     while attempts < max_retries:
@@ -660,10 +697,6 @@ def proxy_transcriptions():
                 with state_lock:
                     key_penalties[key] = time.time() + 120
                     metrics["rate_limit_hits"] += 1
-                if attempts >= 1:
-                    return jsonify({"error": "Rate limit or Forbidden"}), resp.status_code
-                continue
-            elif resp.status_code in [500, 503]:
                 continue
             else:
                 return Response(resp.content, resp.status_code)
@@ -704,10 +737,6 @@ def proxy_embeddings():
                 with state_lock:
                     key_penalties[key] = time.time() + 120
                     metrics["rate_limit_hits"] += 1
-                if attempts >= 1:
-                    return jsonify({"error": "Rate limit or Forbidden"}), resp.status_code
-                continue
-            elif resp.status_code in [500, 503]:
                 continue
             else:
                 return Response(resp.content, resp.status_code)
@@ -733,7 +762,7 @@ def proxy_completions():
         "messages": [{"role": "user", "content": str(prompt)}]
     }
     
-    max_retries = len(API_KEYS) * len(MODELS) if API_KEYS and MODELS else 0
+    max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
     attempts = 0
 
     while attempts < max_retries:
@@ -777,10 +806,6 @@ def proxy_completions():
                 with state_lock:
                     key_penalties[key] = time.time() + 120
                     metrics["rate_limit_hits"] += 1
-                if attempts >= 1:
-                    return jsonify({"error": "Rate limit or Forbidden"}), resp.status_code
-                continue
-            elif resp.status_code in [500, 503]:
                 continue
             else:
                 return Response(resp.content, resp.status_code)
@@ -837,26 +862,30 @@ def proxy_models():
     if request.method == 'OPTIONS':
         return Response(status=200)
         
-    key = API_KEYS[0] if API_KEYS else None
-    if not key:
-        return jsonify({"object": "list", "data": [{"id": "gemini-1.5-flash", "object": "model", "created": int(time.time()), "owned_by": "google"}]})
-        
-    url = "https://generativelanguage.googleapis.com/v1beta/openai/models"
-    headers = {"Authorization": f"Bearer {key}"}
+    with dynamic_models_lock:
+        if OPENAI_MODELS_LIST:
+            return jsonify({"object": "list", "data": OPENAI_MODELS_LIST})
+            
+    models_list = [
+        "gemini-1.5-flash", "gemini-1.5-pro", "gemini-3.5-flash", "gemini-3.5-pro", "gemini-pro",
+        "gemini-working-model", "gemini-1.5-pro-exp-0801", "gemini-1.5-pro-exp-0827",
+        "gemini-1.5-flash-exp-0827", "gemini-1.5-flash-8b-exp-0827", "gemini-1.5-flash-8b-exp-0924",
+        "text-embedding-004", "gemini-embedding-2", "dall-e-3", "whisper-1", "tts-1"
+    ]
     
-    try:
-        resp = requests.get(url, headers=headers)
-        if resp.status_code == 200:
-            excluded_headers = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
-            out_headers = [(name, value) for (name, value) in resp.raw.headers.items() if name.lower() not in excluded_headers]
-            return Response(resp.content, resp.status_code, out_headers)
-    except Exception as e:
-        print(f"Models error: {e}")
+    data = []
+    now = int(time.time())
+    for m in models_list:
+        data.append({
+            "id": m,
+            "object": "model",
+            "created": now,
+            "owned_by": "google"
+        })
         
-    # Fallback to dummy
     return jsonify({
         "object": "list",
-        "data": [{"id": "gemini-1.5-flash", "object": "model", "created": int(time.time()), "owned_by": "google"}]
+        "data": data
     })
 
 @app.route('/add', methods=['POST'])
@@ -885,5 +914,4 @@ def get_status():
     })
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='127.0.0.1', port=8085)
