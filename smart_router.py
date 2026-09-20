@@ -551,9 +551,11 @@ def proxy_chat():
     tried_keys = set()
     is_round_robin = requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model", ""]
     
-    # HARD CAP: Prevent 150-request spam loops but allow enough tries to skip 404 models
-    max_retries = min(len(API_KEYS) * 5, 20) if API_KEYS else 0
-    
+    if is_round_robin:
+        max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
+    else:
+        max_retries = len(API_KEYS) if API_KEYS else 0
+        
     while attempts < max_retries:
         key, rr_model_name = get_next_available_combo()
         if not key:
@@ -630,9 +632,16 @@ def proxy_chat():
                     
                 continue
                 
-            elif resp.status_code in [500, 503, 404]:
-                # Overload/500/503/404: Do NOT penalize or block keys. Try next combo.
+            elif resp.status_code in [500, 503]:
+                # Overload/500/503: Do NOT penalize or block keys. Try next combo.
                 print(f"Model {actual_model} error ({resp.status_code}). Trying next combo without blocking key...")
+                continue
+            elif resp.status_code in [404, 400]:
+                print(f"Model {actual_model} is DEAD/DEPRECATED ({resp.status_code}). Removing from active lists permanently.")
+                with dynamic_models_lock:
+                    global DYNAMIC_MODELS, OPENAI_MODELS_LIST
+                    DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
+                    OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
                 continue
             else:
                 # Other non-200 responses
@@ -774,9 +783,11 @@ def proxy_completions():
     
     is_round_robin = requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model", ""]
     
-    # HARD CAP to prevent spam loops but allow skips
-    max_retries = min(len(API_KEYS) * 5, 20) if API_KEYS else 0
-    
+    if is_round_robin:
+        max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
+    else:
+        max_retries = len(API_KEYS) if API_KEYS else 0
+        
     attempts = 0
     tried_keys = set()
 
