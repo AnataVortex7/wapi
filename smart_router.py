@@ -66,7 +66,7 @@ def refresh_models_loop():
                             name = m["name"].replace("models/", "")
                             new_openai.append({"id": name, "object": "model", "created": now, "owned_by": "google"})
                             methods = m.get("supportedGenerationMethods", [])
-                            if "generateContent" in methods and "vision" not in name.lower() and "embedding" not in name.lower() and "preview" not in name.lower() and not name.startswith("gemini-2.5"):
+                            if "generateContent" in methods and "embedding" not in name.lower() and "tts" not in name.lower() and "image" not in name.lower() and "transcribe" not in name.lower() and "robotics" not in name.lower() and "aqa" not in name.lower():
                                 rpm = 1500 if "flash" in name.lower() else 15
                                 rpd = 1500 if "flash" in name.lower() else 50
                                 new_rr.append({"name": name, "rpm": rpm, "rpd": rpd})
@@ -571,7 +571,8 @@ def proxy_chat():
             last_resp = resp
             
             if resp.status_code == 200:
-                set_sticky_success(k_idx, m_idx) # Save this success so next request starts exactly here!
+                set_sticky_success(k_idx, m_idx)
+                if hasattr(g, "log_entry"): g.log_entry["status"] = f"200 Success ({actual_model})"
                 with state_lock:
                     metrics["successful_api_calls"] += 1
                     safe_key = key[:5] + "..." + key[-5:]
