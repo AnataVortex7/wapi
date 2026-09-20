@@ -115,11 +115,11 @@ def get_next_available_combo():
             key = API_KEYS[current_key_idx]
             model = active_models[current_model_idx]
             
-            # Advance pointers
-            current_model_idx += 1
-            if current_model_idx >= len(active_models):
-                current_model_idx = 0
-                current_key_idx = (current_key_idx + 1) % len(API_KEYS)
+            # Advance pointers: Cycle KEYS first, then MODELS!
+            current_key_idx += 1
+            if current_key_idx >= len(API_KEYS):
+                current_key_idx = 0
+                current_model_idx = (current_model_idx + 1) % len(active_models)
             
             # Check variable penalty
             if key in key_penalties:
@@ -544,9 +544,15 @@ def proxy_chat():
     requested_model = data.get("model", "")
     
     # Try Real APIs across all keys and models
-    max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
     attempts = 0
     last_resp = None
+    
+    # We will track which keys have been tried for specific models to avoid spamming
+    tried_keys = set()
+    is_round_robin = requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model", ""]
+    
+    # HARD CAP: Prevent 150-request spam loops but allow enough tries to skip 404 models
+    max_retries = min(len(API_KEYS) * 5, 20) if API_KEYS else 0
     
     while attempts < max_retries:
         key, rr_model_name = get_next_available_combo()
@@ -556,10 +562,14 @@ def proxy_chat():
         attempts += 1
         
         # If user asked for gemini-pro/auto, do full round-robin. Else use their specific model.
-        if requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model"]:
+        if is_round_robin:
             actual_model = rr_model_name
         else:
-            actual_model = requested_model if requested_model else rr_model_name
+            actual_model = requested_model
+            # Avoid trying the same key multiple times for the exact same specific model
+            if key in tried_keys:
+                continue
+            tried_keys.add(key)
             
         data["model"] = actual_model
         headers = {
@@ -660,7 +670,7 @@ def proxy_transcriptions():
     audio_data = base64.b64encode(audio_file.read()).decode("utf-8")
     mime_type = audio_file.content_type or "audio/ogg"
 
-    max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
+    max_retries = min(len(API_KEYS) * 2, 10) if API_KEYS else 0
     attempts = 0
 
     while attempts < max_retries:
@@ -762,8 +772,13 @@ def proxy_completions():
         "messages": [{"role": "user", "content": str(prompt)}]
     }
     
-    max_retries = len(API_KEYS) * len(get_active_models()) if API_KEYS and get_active_models() else 0
+    is_round_robin = requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model", ""]
+    
+    # HARD CAP to prevent spam loops but allow skips
+    max_retries = min(len(API_KEYS) * 5, 20) if API_KEYS else 0
+    
     attempts = 0
+    tried_keys = set()
 
     while attempts < max_retries:
         key, rr_model_name = get_next_available_combo()
@@ -771,10 +786,13 @@ def proxy_completions():
             break
         attempts += 1
         
-        if requested_model.lower() in ["gemini-pro", "auto", "default", "round-robin", "gemini-working-model"]:
+        if is_round_robin:
             actual_model = rr_model_name
         else:
-            actual_model = requested_model if requested_model else rr_model_name
+            actual_model = requested_model
+            if key in tried_keys:
+                continue
+            tried_keys.add(key)
             
         chat_data["model"] = actual_model
         
