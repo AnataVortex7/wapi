@@ -472,7 +472,7 @@ def _list_combos_in_order(requested_model: str):
     """
     active_models = get_active_models()
 
-    GENERIC_ALIASES = {"gemini-pro", "auto", "default", "round-robin",
+    GENERIC_ALIASES = {"gemini-pro", "auto", "default", "openrouter/auto", "round-robin",
                         "gemini-working-model", ""}
     is_pool_mode = requested_model.lower() in GENERIC_ALIASES
 
