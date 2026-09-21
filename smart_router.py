@@ -238,6 +238,55 @@ def capture_signatures(body: bytes):
     except Exception as e:
         print(f"[SIG CAPTURE] {e}")
 
+# ─── Responses-API / unknown-field normalization ──────────────────────────────
+# Some clients (Hermes included) call POST /v1/responses instead of
+# /v1/chat/completions once you pick a SPECIFIC model from the model list
+# ("auto"/round-robin/reset stays on /v1/chat/completions -> that's why reset
+# "worked"). The Responses API has a different shape: "input" instead of
+# "messages", "instructions" instead of a system message, plus Responses-only
+# fields like "include", "prompt_cache_key", "store", "previous_response_id",
+# "text", "reasoning". Google's Gemini OpenAI-compat endpoint only implements
+# classic Chat Completions and does strict schema validation -- any of those
+# extra keys makes it reject the WHOLE request with 400 "Unknown name ...
+# Cannot find field", even though model/messages were fine. Normalizing every
+# incoming body into plain Chat Completions shape here fixes it permanently,
+# no matter which endpoint/client/model sent the request.
+CHAT_COMPLETIONS_ALLOWED_KEYS = {
+    "model", "messages", "temperature", "top_p", "top_k", "max_tokens",
+    "max_completion_tokens", "stream", "stream_options", "stop", "n",
+    "presence_penalty", "frequency_penalty", "logit_bias", "seed",
+    "tools", "tool_choice", "functions", "function_call",
+    "response_format", "logprobs", "top_logprobs", "parallel_tool_calls",
+    "_conv_hint",  # internal marker, stripped later in proxy_chat before forwarding
+}
+
+def normalize_to_chat_completions(data: dict) -> dict:
+    """Accepts either a normal Chat Completions body OR a Responses-API body
+    and returns something Gemini's /v1beta/openai/chat/completions accepts."""
+    data = dict(data)
+
+    if "messages" not in data and "input" in data:
+        raw_input = data.pop("input")
+        if isinstance(raw_input, str):
+            data["messages"] = [{"role": "user", "content": raw_input}]
+        elif isinstance(raw_input, list):
+            msgs = []
+            for item in raw_input:
+                if isinstance(item, dict) and "role" in item:
+                    content = item.get("content")
+                    if isinstance(content, list):  # Responses API content parts
+                        content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+                    msgs.append({"role": item["role"], "content": content})
+            data["messages"] = msgs
+        else:
+            data["messages"] = []
+
+    instructions = data.pop("instructions", None)
+    if instructions:
+        data["messages"] = [{"role": "system", "content": instructions}] + data.get("messages", [])
+
+    return {k: v for k, v in data.items() if k in CHAT_COMPLETIONS_ALLOWED_KEYS}
+
 def prepare_payload(data: dict, model_name: str, force_dummy: bool = False) -> dict:
     """Copy of the request with signatures fixed up for the chosen model.
     - gemini-*  : restore the cached real signature; dummy if none cached
@@ -612,7 +661,7 @@ def requires_browser_auth(f):
 def strict_password_and_log():
     if request.method == 'OPTIONS':
         return
-    if request.path in ['/ping', '/healthz', '/logs', '/dashboard_data']:
+    if request.path in ['/ping', '/healthz', '/logs', '/dashboard_data', '/status']:
         return
     expected_pass = os.environ.get("PASSWORD", "")
     auth_header   = request.headers.get("Authorization", "")
@@ -814,6 +863,7 @@ def proxy_chat():
         data['_conv_hint'] = conv_hint
     data.pop('session_id', None)
     data.pop('user', None)
+    data = normalize_to_chat_completions(data)  # <-- strips Responses-API/unknown fields that caused the 400s
     requested_model = data.get("model", "")
     if "/" in requested_model:
         requested_model = requested_model.split("/")[-1]
@@ -1108,6 +1158,7 @@ def add_key_model():
     return jsonify({"status": "success", "keys_count": len(API_KEYS), "models": MODELS})
 
 @app.route('/status', methods=['GET'])
+@requires_browser_auth
 def get_status():
     now = time.time()
     now_mono = time.monotonic()
