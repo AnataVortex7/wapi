@@ -4,7 +4,7 @@ from collections import deque
 from flask import Flask, request, jsonify, Response, render_template_string, g
 from functools import wraps
 import requests
-import base64, copy, hashlib, re
+import base64, copy, hashlib, re, uuid
 
 app = Flask(__name__)
 
@@ -322,6 +322,87 @@ def normalize_to_chat_completions(data: dict) -> dict:
         data["messages"] = [{"role": "system", "content": instructions}] + data.get("messages", [])
 
     return {k: v for k, v in data.items() if k in CHAT_COMPLETIONS_ALLOWED_KEYS}
+
+# ─── Responses-API response reconstruction ────────────────────────────────────
+# Fixing the REQUEST shape (above) was step 1. Step 2: when the caller hit
+# /v1/responses, Gemini still answers in plain Chat-Completions JSON/SSE --
+# a totally different event protocol than the Responses API stream a
+# Responses-API client (Hermes/Codex) is parsing. Relaying Gemini's stream
+# unchanged meant the client waited forever for a Responses-shaped terminal
+# event ("response.completed") that would never arrive -> "Codex Responses
+# stream did not emit a terminal response". Fix: for /v1/responses we always
+# call Gemini with stream forced OFF (one complete JSON back, no partial-SSE
+# translation needed), rebuild a real Responses-API object from it, and if
+# the ORIGINAL caller wanted streaming we emit our own minimal-but-valid
+# Responses SSE stream that is guaranteed to end with response.completed.
+def _gemini_choice_to_responses_output(choice: dict) -> list:
+    msg = (choice or {}).get("message") or {}
+    items = []
+    content_text = msg.get("content") or ""
+    if content_text:
+        items.append({
+            "type": "message",
+            "id": f"msg_{uuid.uuid4().hex[:24]}",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": content_text, "annotations": []}],
+        })
+    for tc in (msg.get("tool_calls") or []):
+        fn = tc.get("function") or {}
+        items.append({
+            "type": "function_call",
+            "id": f"fc_{uuid.uuid4().hex[:24]}",
+            "call_id": tc.get("id") or f"call_{uuid.uuid4().hex[:24]}",
+            "name": fn.get("name", ""),
+            "arguments": fn.get("arguments", "{}"),
+            "status": "completed",
+        })
+    return items
+
+def chat_completion_to_responses_json(gemini_json: dict, model: str) -> dict:
+    choices = gemini_json.get("choices") or [{}]
+    output = _gemini_choice_to_responses_output(choices[0])
+    text_parts = [it["content"][0]["text"] for it in output if it["type"] == "message"]
+    return {
+        "id": gemini_json.get("id") or f"resp_{uuid.uuid4().hex[:24]}",
+        "object": "response",
+        "created_at": gemini_json.get("created", int(time.time())),
+        "status": "completed",
+        "model": model,
+        "output": output,
+        "output_text": "".join(text_parts),
+        "usage": gemini_json.get("usage", {}),
+    }
+
+def responses_sse_stream(resp_json: dict):
+    """Minimal-but-valid Responses-API SSE stream. Always ends with the
+    response.completed terminal event -- that guarantee is the actual fix."""
+    yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': resp_json})}\n\n"
+    for item in resp_json["output"]:
+        if item["type"] == "message":
+            text = item["content"][0]["text"]
+            yield (f"event: response.output_text.delta\ndata: "
+                   f"{json.dumps({'type': 'response.output_text.delta', 'item_id': item['id'], 'delta': text})}\n\n")
+    yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': resp_json})}\n\n"
+    yield "data: [DONE]\n\n"
+
+def _finalize_success_response(resp, is_responses_api: bool, actual_model: str, client_stream_requested: bool):
+    """Build the Response for a 200 from Gemini. Plain /v1/chat/completions
+    calls are relayed unchanged (existing behaviour). /v1/responses calls
+    get converted into a real Responses-API object (see above)."""
+    excluded = ['content-encoding', 'content-length', 'transfer-encoding', 'connection']
+    if not is_responses_api:
+        out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
+        return Response(resp.content, resp.status_code, out_headers)
+    try:
+        gemini_json = resp.json()
+    except Exception:
+        out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
+        return Response(resp.content, resp.status_code, out_headers)
+    responses_json = chat_completion_to_responses_json(gemini_json, actual_model)
+    if client_stream_requested:
+        return Response(responses_sse_stream(responses_json), mimetype="text/event-stream")
+    return jsonify(responses_json)
 
 def prepare_payload(data: dict, model_name: str, force_dummy: bool = False) -> dict:
     """Copy of the request with signatures fixed up for the chosen model.
@@ -900,6 +981,10 @@ def proxy_chat():
     data.pop('session_id', None)
     data.pop('user', None)
     data = normalize_to_chat_completions(data)  # <-- strips Responses-API/unknown fields that caused the 400s
+    is_responses_api = request.path.startswith('/v1/responses')
+    client_stream_requested = bool(data.get("stream"))
+    if is_responses_api:
+        data["stream"] = False  # always get one complete JSON back from Gemini; we rebuild the Responses stream ourselves
     requested_model = data.get("model", "")
     if "/" in requested_model:
         requested_model = requested_model.split("/")[-1]
@@ -935,9 +1020,7 @@ def proxy_chat():
                     capture_signatures(resp.content)
                     with state_lock:
                         metrics["successful_api_calls"] += 1
-                    excluded = ['content-encoding','content-length','transfer-encoding','connection']
-                    out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
-                    return Response(resp.content, resp.status_code, out_headers)
+                    return _finalize_success_response(resp, is_responses_api, actual_model, client_stream_requested)
                 if resp.status_code in (429, 403):
                     err = resp.text.lower()
                     with state_lock:
@@ -1013,9 +1096,7 @@ def proxy_chat():
                     metrics["usage_by_key"][safe_key][actual_model] = \
                         metrics["usage_by_key"][safe_key].get(actual_model, 0) + 1
 
-                excluded = ['content-encoding','content-length','transfer-encoding','connection']
-                out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
-                return Response(resp.content, resp.status_code, out_headers)
+                return _finalize_success_response(resp, is_responses_api, actual_model, client_stream_requested)
 
             elif resp.status_code in [429, 403]:
                 err_text = ""
