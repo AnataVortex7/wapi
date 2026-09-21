@@ -504,7 +504,7 @@ def intercept_signatures(content_bytes):
                         if 'tool_calls' in delta:
                             for tc in delta['tool_calls']:
                                 tc_id = tc.get('id')
-                                sig = tc.get('thought_signature')
+                                sig = tc.get('thought_signature') or (tc.get('function', {})).get('thought_signature')
                                 if tc_id and sig:
                                     THOUGHT_SIGNATURES[tc_id] = sig
                 except:
@@ -517,7 +517,7 @@ def intercept_signatures(content_bytes):
                         if 'tool_calls' in message:
                             for tc in message['tool_calls']:
                                 tc_id = tc.get('id')
-                                sig = tc.get('thought_signature')
+                                sig = tc.get('thought_signature') or (tc.get('function', {})).get('thought_signature')
                                 if tc_id and sig:
                                     THOUGHT_SIGNATURES[tc_id] = sig
                 except:
@@ -544,10 +544,13 @@ def proxy_chat():
                 for tc in msg["tool_calls"]:
                     if tc.get("type") == "function":
                         tc_id = tc.get("id")
-                        if tc_id in THOUGHT_SIGNATURES:
-                            tc["thought_signature"] = THOUGHT_SIGNATURES[tc_id]
-                        elif "thought_signature" not in tc:
-                            tc["thought_signature"] = ""
+                        sig = THOUGHT_SIGNATURES.get(tc_id, "")
+                        
+                        # Inject at both levels to be absolutely sure we satisfy the schema!
+                        tc["thought_signature"] = sig
+                        if "function" not in tc:
+                            tc["function"] = {}
+                        tc["function"]["thought_signature"] = sig
 
     requested_model = data.get("model", "")
     
