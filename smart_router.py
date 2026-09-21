@@ -61,6 +61,117 @@ key_daily_penalty: dict = {}
 # retried forever. Cleared on process restart.
 PERMANENTLY_BROKEN_MODELS: set = set()
 
+# ─── Conversation stickiness (fixes Gemini thought_signature 400s) ───────────
+# Gemini 2.5/3 "thinking" models attach an encrypted thought_signature to
+# function-call parts. That signature is only valid when it is echoed back
+# to the SAME model (and same underlying key/project) that produced it. Our
+# round-robin picks a fresh (key, model) on every incoming HTTP request --
+# which is correct for independent, one-shot chats, but breaks any request
+# that is a *continuation* of a tool-calling turn (an agent like Hermes
+# sending the function result back): if that continuation lands on a
+# different (key, model) than the one that emitted the function call, Gemini
+# rejects it with "signature missing/mismatch" (400) and the agent's task
+# stalls mid-execution.
+#
+# Fix: give each conversation a stable id and pin it to the (key, model)
+# that handled its most recent successful turn, as long as that slot is
+# still viable (not rate-limited / not broken). Independent conversations
+# still spread freely across every key+model, so your overall quota usage
+# is unaffected -- only steps *within* one tool-calling task stay glued to
+# the same model.
+CONV_STICKY_TTL = 3 * 60 * 60   # forget a caller's pin after 3h of no traffic
+STICKY_MAX_WAIT = 90.0          # max seconds to hold a request waiting on RPM
+conversation_sticky: dict = {}   # client_id -> (key, model_name, last_used_monotonic)
+
+def _client_id_from_request(data: dict, remote_addr: str) -> str:
+    """Identity used to pin a caller to one (key, model). Prefers an
+    explicit id the client sends (session_id / user); otherwise falls back
+    to the caller's IP. For a single-bot setup like Hermes → wapi, every
+    call comes from the same IP anyway, so this behaves as one global pin --
+    exactly what you want: whichever model is doing the current
+    thinking/tool-call work stays fixed until its daily quota runs out."""
+    explicit = data.get("_conv_hint")
+    if explicit:
+        return f"id:{explicit}"
+    return f"ip:{remote_addr or 'unknown'}"
+
+def _is_tool_continuation(messages: list) -> bool:
+    """True if this request is continuing a function-calling turn (an
+    assistant tool_calls message or a tool-result message is present) --
+    i.e. it MUST stay on the (key, model) that started this turn, or Gemini
+    will reject the thought_signature."""
+    for m in messages:
+        role = m.get("role")
+        if role == "tool" or (role == "assistant" and m.get("tool_calls")):
+            return True
+    return False
+
+def _prune_conv_sticky():
+    cutoff = time.monotonic() - CONV_STICKY_TTL
+    dead = [cid for cid, (_, _, ts) in conversation_sticky.items() if ts < cutoff]
+    for cid in dead:
+        conversation_sticky.pop(cid, None)
+
+def _pin_hard_dead(key, model_name, model_dict) -> bool:
+    """True only for failures that CANNOT be waited out: this (key, model)
+    is permanently incompatible or its daily (RPD) quota is gone for today.
+    RPM being momentarily full is NOT included here -- that's what we wait
+    on instead of switching (see acquire_sticky_slot_wait)."""
+    if (key, model_name) in PERMANENTLY_BROKEN_MODELS: return True
+    if _is_daily_penalized(key, model_name): return True
+    if not _rpd_available(key, model_name, model_dict["rpd"]): return True
+    return False
+
+def acquire_sticky_slot_wait(client_id: str):
+    """
+    Resolve the pinned slot for this client, WAITING (not switching) while
+    it's only RPM-limited, since RPM resets within ~60s and switching model
+    mid-task would break the thought_signature.
+
+    Returns one of:
+      ("ok", key, model_dict)   -> reserved and ready to use
+      ("exhausted", None, None) -> daily quota / permanent break: pin
+                                    cleared, caller should surface an error
+                                    to the user; their NEXT fresh message
+                                    will get a brand-new pin
+      ("busy", None, None)      -> still RPM-limited after STICKY_MAX_WAIT;
+                                    pin is kept (not cleared) so the next
+                                    retry can resume on it
+      (None, None, None)        -> no pin exists yet for this client
+    """
+    deadline = time.monotonic() + STICKY_MAX_WAIT
+    while True:
+        with state_lock:
+            _prune_conv_sticky()
+            entry = conversation_sticky.get(client_id)
+            if not entry:
+                return (None, None, None)
+            key, model_name, _ = entry
+            model_dict = next((m for m in MODELS if m["name"] == model_name), None)
+
+            if model_dict is None or _pin_hard_dead(key, model_name, model_dict):
+                conversation_sticky.pop(client_id, None)
+                return ("exhausted", None, None)
+
+            if _is_rpm_cooldown(key, model_name) or not _rpm_available(key, model_name, model_dict["rpm"]):
+                rpm_blocked = True
+            else:
+                rpm_blocked = False
+
+            if not rpm_blocked:
+                _record_request(key, model_name)
+                conversation_sticky[client_id] = (key, model_name, time.monotonic())
+                return ("ok", key, model_dict)
+
+        # RPM-limited only -- wait it out instead of switching models.
+        if time.monotonic() >= deadline:
+            return ("busy", None, None)
+        time.sleep(1.0)
+
+def remember_sticky_slot(client_id: str, key: str, model_name: str):
+    with state_lock:
+        conversation_sticky[client_id] = (key, model_name, time.monotonic())
+
 # Last RPD reset date (IST)
 _last_rpd_reset = datetime.datetime.now(IST).strftime("%Y-%m-%d")
 
@@ -549,12 +660,86 @@ def proxy_chat():
         metrics["total_incoming_requests"] += 1
 
     data = request.json or {}
+    # Capture a conversation id BEFORE popping these -- session_id/user are
+    # the clearest hints a client can give us; we fall back to the caller's
+    # IP otherwise (see _client_id_from_request).
+    conv_hint = data.get('session_id') or data.get('user')
+    if conv_hint:
+        data['_conv_hint'] = conv_hint
     data.pop('session_id', None)
     data.pop('user', None)
     requested_model = data.get("model", "")
+    messages = data.get("messages", []) or []
+    remote_addr = request.headers.get("X-Real-IP") or \
+                  (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()) or \
+                  request.remote_addr
+    client_id = _client_id_from_request(data, remote_addr)
+    data.pop('_conv_hint', None)
+    is_continuation = _is_tool_continuation(messages)
 
     last_resp = None
     tried = set()  # (key, model_name) already attempted this request
+
+    if is_continuation:
+        # MUST stay on the (key, model) that started this tool-calling
+        # turn, or Gemini's thought_signature check fails. Wait through
+        # short RPM limits instead of switching; only give up (and clear
+        # the pin) once the daily quota is genuinely gone.
+        outcome, key, model = acquire_sticky_slot_wait(client_id)
+
+        if outcome == "exhausted":
+            return jsonify({
+                "error": {
+                    "message": "Daily quota exhausted for the model handling this "
+                                "task. This step could not be completed on the same "
+                                "model, so the thought/tool signature can't carry "
+                                "over. Please send a new message to start fresh "
+                                "(it will pick up a working model automatically).",
+                    "type": "quota_exceeded"
+                }
+            }), 429
+
+        if outcome == "busy":
+            return jsonify({
+                "error": {
+                    "message": "The model handling this task is briefly rate-limited. "
+                                "Please retry in a few seconds -- it will resume on "
+                                "the same model.",
+                    "type": "rate_limit_error"
+                }
+            }), 429
+
+        if outcome == "ok":
+            print(f"[STICKY] {client_id} → staying on key=…{key[-6:]} model={model['name']}")
+            tried.add((key, model["name"]))
+            actual_model = model["name"]
+            data["model"] = actual_model
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+            try:
+                resp = requests.post(url, json=data, headers=headers, stream=True, timeout=120)
+                if resp.status_code == 200:
+                    remember_sticky_slot(client_id, key, actual_model)
+                    with state_lock:
+                        metrics["successful_api_calls"] += 1
+                    excluded = ['content-encoding','content-length','transfer-encoding','connection']
+                    out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
+                    return Response(resp.content, resp.status_code, out_headers)
+                # A non-200 on the pinned slot despite our own RPM/RPD checks
+                # passing (e.g. Google's own limit differs slightly from
+                # ours, or a genuine signature/payload issue) -- surface it
+                # directly rather than silently trying a different model,
+                # since a different model can't validate this signature
+                # anyway.
+                excluded = ['content-encoding','content-length','transfer-encoding','connection']
+                out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
+                return Response(resp.content, resp.status_code, out_headers)
+            except Exception as e:
+                return jsonify({"error": {"message": f"Upstream error on pinned model: {e}", "type": "upstream_error"}}), 502
+        # outcome is None -> no pin exists yet for this client (e.g. process
+        # just restarted mid-task). Nothing safe to resume -- fall through
+        # to normal routing below; this one step may still 400, but the
+        # NEXT message from the user will get a clean new pin.
 
     # How many total distinct (key, model) attempts to allow per incoming
     # request before giving up. Sized to the whole pool so that under load
@@ -562,9 +747,12 @@ def proxy_chat():
     max_attempts = max(20, len(API_KEYS) * max(1, len(MODELS)) + 5)
 
     for attempt in range(max_attempts):
-        # Atomic: pick a viable (key, model) AND reserve it in one lock hold.
-        # This closes the race window multiple simultaneous users could hit
-        # under the old "list combos, then record separately" approach.
+        # Atomic: pick a viable (key, model) AND reserve it in one lock
+        # hold. This closes the race window multiple simultaneous users
+        # could hit under the old "list combos, then record separately"
+        # approach. Fresh (non-continuation) requests are free to spread
+        # across every key/model -- this is what keeps your whole pool's
+        # quota in use.
         slot = acquire_next_slot(requested_model, exclude=tried)
 
         if slot is None:
@@ -600,7 +788,13 @@ def proxy_chat():
             last_resp = resp
 
             if resp.status_code == 200:
-                set_sticky_success(k_idx, m_idx)
+                if k_idx >= 0:
+                    set_sticky_success(k_idx, m_idx)
+                # Pin this conversation to this exact (key, model) so that
+                # if the assistant's reply contains a tool call, the NEXT
+                # request (the tool result) lands back on the same slot and
+                # its thought_signature still validates.
+                remember_sticky_slot(client_id, key, actual_model)
                 if hasattr(g, "log_entry"):
                     g.log_entry["status"] = f"200 Success ({actual_model})"
                 with state_lock:
