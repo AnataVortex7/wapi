@@ -61,50 +61,18 @@ metrics = {
 }
 
 dynamic_models_lock = threading.Lock()
-DYNAMIC_MODELS = []
+DYNAMIC_MODELS = MODELS
+
 OPENAI_MODELS_LIST = []
-
-def refresh_models_loop():
-    global DYNAMIC_MODELS, OPENAI_MODELS_LIST
-    while True:
-        if API_KEYS:
-            for key in API_KEYS:
-                try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={key}"
-                    resp = requests.get(url, timeout=10)
-                    if resp.status_code == 200:
-                        data = resp.json().get("models", [])
-                        new_rr = []
-                        new_openai = []
-                        now = int(time.time())
-                        for m in data:
-                            name = m["name"].replace("models/", "")
-                            methods = m.get("supportedGenerationMethods", [])
-                            # Only include models that generate text/content, and exclude specific modalities/experimental tool-breaking models
-                            if "generateContent" in methods and name.startswith("gemini-") and not any(x in name.lower() for x in ["embedding", "tts", "image", "transcribe", "robotics", "aqa", "thinking", "working", "learnlm"]):
-                                new_openai.append({"id": name, "object": "model", "created": now, "owned_by": "google"})
-                                rpm, rpd = default_rpm_rpd(name)
-                                new_rr.append({"name": name, "rpm": rpm, "rpd": rpd})
-                        for extra in ["dall-e-3", "whisper-1", "tts-1"]:
-                            if not any(x["id"] == extra for x in new_openai):
-                                new_openai.append({"id": extra, "object": "model", "created": now, "owned_by": "google"})
-                        with dynamic_models_lock:
-                            if new_rr:
-                                DYNAMIC_MODELS = new_rr
-                                OPENAI_MODELS_LIST = new_openai
-                        break
-                except Exception as e:
-                    print(f"Model refresh error: {e}")
-        if not DYNAMIC_MODELS:
-            time.sleep(60)
-        else:
-            time.sleep(3600)  # refresh hourly so new/updated models show up sooner
-
-threading.Thread(target=refresh_models_loop, daemon=True).start()
+now = int(time.time())
+for m in MODELS:
+    OPENAI_MODELS_LIST.append({"id": m["name"], "object": "model", "created": now, "owned_by": "google"})
+for extra in ["dall-e-3", "whisper-1", "tts-1"]:
+    OPENAI_MODELS_LIST.append({"id": extra, "object": "model", "created": now, "owned_by": "google"})
 
 def get_active_models():
     with dynamic_models_lock:
-        return DYNAMIC_MODELS if DYNAMIC_MODELS else MODELS
+        return DYNAMIC_MODELS
 
 state_lock = threading.Lock()
 mgr = SmartKeyManager(API_KEYS, get_active_models)
@@ -486,9 +454,29 @@ def handle_model_error(actual_model):
         DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
         OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
 
-THOUGHT_SIGNATURES = {}
+import os
+SIGNATURES_FILE = "thought_signatures.json"
+
+def load_signatures():
+    if os.path.exists(SIGNATURES_FILE):
+        try:
+            with open(SIGNATURES_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {}
+
+def save_signatures():
+    try:
+        with open(SIGNATURES_FILE, 'w') as f:
+            json.dump(THOUGHT_SIGNATURES, f)
+    except:
+        pass
+
+THOUGHT_SIGNATURES = load_signatures()
 
 def intercept_signatures(content_bytes):
+    ACTIVE_TOOL_CALL_IDS = {}
     try:
         text = content_bytes.decode('utf-8', errors='ignore')
         for line in text.split('\n'):
@@ -503,7 +491,13 @@ def intercept_signatures(content_bytes):
                         delta = choice.get('delta', {})
                         if 'tool_calls' in delta:
                             for tc in delta['tool_calls']:
+                                idx = tc.get('index')
                                 tc_id = tc.get('id')
+                                if tc_id:
+                                    ACTIVE_TOOL_CALL_IDS[idx] = tc_id
+                                else:
+                                    tc_id = ACTIVE_TOOL_CALL_IDS.get(idx)
+                                
                                 sig = tc.get('thought_signature') or (tc.get('function', {})).get('thought_signature')
                                 if tc_id and sig:
                                     THOUGHT_SIGNATURES[tc_id] = sig
@@ -522,6 +516,7 @@ def intercept_signatures(content_bytes):
                                     THOUGHT_SIGNATURES[tc_id] = sig
                 except:
                     pass
+        save_signatures()
     except:
         pass
 
@@ -534,6 +529,14 @@ def proxy_chat():
         metrics["total_incoming_requests"] += 1
 
     data = request.json or {}
+    
+    # DEBUG LOGGING for thought_signature issue
+    if "messages" in data:
+        with open("/tmp/wapi_debug.log", "a") as f:
+            f.write("--- INCOMING REQUEST ---\n")
+            f.write(json.dumps(data["messages"], indent=2))
+            f.write("\n")
+            
     data.pop('session_id', None)
     data.pop('user', None)
 
@@ -551,6 +554,13 @@ def proxy_chat():
                         if "function" not in tc:
                             tc["function"] = {}
                         tc["function"]["thought_signature"] = sig
+
+    if "messages" in data:
+        with open("/tmp/wapi_debug.log", "a") as f:
+            f.write("--- INJECTED REQUEST ---\n")
+            f.write(f"KNOWN SIGNATURES: {list(THOUGHT_SIGNATURES.keys())}\n")
+            f.write(json.dumps(data["messages"], indent=2))
+            f.write("\n")
 
     requested_model = data.get("model", "")
     

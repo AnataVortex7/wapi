@@ -66,10 +66,6 @@ class SmartKeyManager:
             best = None
             if valid_combos:
                 best = valid_combos[0]
-            elif cooling_combos:
-                # If everything is cooling down, try the one that will cool down first
-                cooling_combos.sort(key=lambda x: self.short_cooldowns.get((x[0], x[1]), 0))
-                best = cooling_combos[0]
                 
             if best:
                 key, actual_model, idx = best
@@ -90,7 +86,7 @@ class SmartKeyManager:
         with self.lock:
             if status_code in [429, 403]:
                 error_text = response_text.lower()
-                if "per day" in error_text:
+                if "per day" in error_text or "quota" in error_text:
                     now_utc = datetime.datetime.utcnow()
                     ist_offset = datetime.timedelta(hours=5, minutes=30)
                     now_ist = now_utc + ist_offset
@@ -99,6 +95,9 @@ class SmartKeyManager:
                     self.key_penalties[pen_key] = next_midnight_utc.timestamp()
                 else:
                     self.short_cooldowns[pen_key] = now + 90 
+            elif status_code in [500, 503]:
+                # Server error / Overloaded, cooldown for 10 seconds to force switching key/model
+                self.short_cooldowns[pen_key] = now + 10
 
 
 def make_request_with_smart_retry(manager, call_fn, preferred_model, max_retries=5, on_model_error=None):
@@ -123,6 +122,7 @@ def make_request_with_smart_retry(manager, call_fn, preferred_model, max_retries
                 continue 
                 
             elif resp.status_code in [500, 503]:
+                manager.mark_failure(key, actual_model, resp.status_code, resp.text if hasattr(resp, 'text') else "")
                 continue 
                 
             elif resp.status_code in [404, 400]:
