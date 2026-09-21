@@ -79,9 +79,10 @@ def refresh_models_loop():
                         now = int(time.time())
                         for m in data:
                             name = m["name"].replace("models/", "")
-                            new_openai.append({"id": name, "object": "model", "created": now, "owned_by": "google"})
                             methods = m.get("supportedGenerationMethods", [])
-                            if "generateContent" in methods and "embedding" not in name.lower() and "tts" not in name.lower() and "image" not in name.lower() and "transcribe" not in name.lower() and "robotics" not in name.lower() and "aqa" not in name.lower():
+                            # Only include models that generate text/content, and exclude specific modalities/experimental tool-breaking models
+                            if "generateContent" in methods and not any(x in name.lower() for x in ["embedding", "tts", "image", "transcribe", "robotics", "aqa", "thinking"]):
+                                new_openai.append({"id": name, "object": "model", "created": now, "owned_by": "google"})
                                 rpm, rpd = default_rpm_rpd(name)
                                 new_rr.append({"name": name, "rpm": rpm, "rpd": rpd})
                         for extra in ["dall-e-3", "whisper-1", "tts-1"]:
@@ -478,6 +479,13 @@ setInterval(fetchData, 5000);
 """
     return render_template_string(html)
 
+def handle_model_error(actual_model):
+    print(f"Model {actual_model} error (400/404). Removing from active lists permanently.")
+    with dynamic_models_lock:
+        global DYNAMIC_MODELS, OPENAI_MODELS_LIST
+        DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
+        OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
+
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 def proxy_chat():
     if request.method == 'OPTIONS':
@@ -501,7 +509,7 @@ def proxy_chat():
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         return requests.post(url, json=data, headers=headers, stream=True)
 
-    resp, key, actual_model = make_request_with_smart_retry(mgr, call_fn, requested_model)
+    resp, key, actual_model = make_request_with_smart_retry(mgr, call_fn, requested_model, on_model_error=handle_model_error)
     
     if resp is not None:
         if resp.status_code == 200:
@@ -557,7 +565,7 @@ def proxy_transcriptions():
         headers = {"Content-Type": "application/json"}
         return requests.post(url, headers=headers, json=data)
 
-    resp, key, actual_model = make_request_with_smart_retry(mgr, call_fn, "gemini-1.5-flash")
+    resp, key, actual_model = make_request_with_smart_retry(mgr, call_fn, "gemini-1.5-flash", on_model_error=handle_model_error)
     
     if resp is not None:
         if resp.status_code == 200:

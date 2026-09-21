@@ -101,7 +101,7 @@ class SmartKeyManager:
                     self.short_cooldowns[pen_key] = now + 90 
 
 
-def make_request_with_smart_retry(manager, call_fn, preferred_model, max_retries=5):
+def make_request_with_smart_retry(manager, call_fn, preferred_model, max_retries=5, on_model_error=None):
     last_resp = None
     
     for attempt in range(max_retries):
@@ -124,6 +124,11 @@ def make_request_with_smart_retry(manager, call_fn, preferred_model, max_retries
                 
             elif resp.status_code in [500, 503]:
                 continue 
+                
+            elif resp.status_code in [404, 400]:
+                if on_model_error:
+                    on_model_error(actual_model)
+                continue
                 
             else:
                 return resp, key, actual_model
