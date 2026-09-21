@@ -53,6 +53,14 @@ rpm_cooldown: dict = {}
 # so penalizing the whole key was both wrong and wasteful.
 key_daily_penalty: dict = {}
 
+# (key, model_name) pairs that returned a hard compatibility error (e.g.
+# "This model only supports Interactions API", missing thought_signature)
+# rather than a rate-limit error. These are not transient -- retrying won't
+# help until the proxy code itself is changed to speak that model's newer
+# API shape -- so they're excluded from routing entirely instead of being
+# retried forever. Cleared on process restart.
+PERMANENTLY_BROKEN_MODELS: set = set()
+
 # Last RPD reset date (IST)
 _last_rpd_reset = datetime.datetime.now(IST).strftime("%Y-%m-%d")
 
@@ -274,6 +282,8 @@ def acquire_next_slot(requested_model: str, exclude: set):
         for (k_i, m_i, key, model) in combos:
             if (key, model["name"]) in exclude:
                 continue
+            if (key, model["name"]) in PERMANENTLY_BROKEN_MODELS:
+                continue
             if _is_daily_penalized(key, model["name"]):
                 continue
             if _is_rpm_cooldown(key, model["name"]):
@@ -304,6 +314,8 @@ def get_best_combo(requested_model: str):
         combos = _list_combos_in_order(requested_model)
         viable = []
         for (k_i, m_i, key, model) in combos:
+            if (key, model["name"]) in PERMANENTLY_BROKEN_MODELS:
+                continue
             if _is_daily_penalized(key, model["name"]):
                 continue
             if _is_rpm_cooldown(key, model["name"]):
@@ -633,11 +645,50 @@ def proxy_chat():
                 continue
 
             elif resp.status_code in [400, 404]:
-                print(f"[{resp.status_code}] model={actual_model} invalid, removing from pool")
-                with dynamic_models_lock:
-                    global DYNAMIC_MODELS, OPENAI_MODELS_LIST
-                    DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
-                    OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
+                err_text = ""
+                try: err_text = resp.text.lower()
+                except: pass
+
+                # Two different kinds of 400 need different handling:
+                #
+                # 1. Payload/compatibility errors ("Interactions API" only,
+                #    missing thought_signature, etc.) mean THIS MODEL cannot
+                #    be used through this chat/completions-style proxy at
+                #    all -- retrying it will just fail again, forever, and
+                #    without this fix it silently got re-picked every time
+                #    because the old code only ever removed models from the
+                #    unused DYNAMIC_MODELS list, never from MODELS (the env
+                #    pool that auto mode actually uses).
+                #
+                # 2. Genuine bad-request errors caused by the request body
+                #    itself (bad JSON, unsupported field, etc.) would repeat
+                #    on every model/key too, but are not model-specific --
+                #    those should not silently disable a model, so we only
+                #    hard-disable the model on the known compatibility
+                #    signatures below and otherwise just move on and let the
+                #    request fail after trying a couple of other slots.
+                model_is_incompatible = any(sig in err_text for sig in [
+                    "interactions api",
+                    "thought_signature",
+                    "not supported",
+                    "unsupported",
+                ])
+
+                if model_is_incompatible:
+                    with state_lock:
+                        # Disable this model for THIS key permanently for the
+                        # rest of the process lifetime (until restart/redeploy)
+                        # -- it will never succeed on this key, so don't waste
+                        # future requests retrying it. midnight-IST-style
+                        # cooldown doesn't apply here since the problem isn't
+                        # rate limiting, it's a hard incompatibility.
+                        PERMANENTLY_BROKEN_MODELS.add((key, actual_model))
+                        metrics["failed_requests"] += 1
+                    print(f"[400 INCOMPATIBLE] key=…{key[-6:]} model={actual_model} "
+                          f"does not work via this proxy shape → disabled for this key, switching instantly")
+                else:
+                    print(f"[{resp.status_code}] model={actual_model} bad request, trying next combo...")
+                continue  # instantly try the next key/model regardless
                 continue
 
             else:
@@ -749,11 +800,13 @@ def get_status():
                      for (k,m),ts in key_daily_penalty.items() if ts > now}
         cooldowns = {f"{k[:5]}...{k[-5:]}|{m}": round(ts-now_mono,1)
                      for (k,m),ts in rpm_cooldown.items() if ts > now_mono}
+        broken = [f"{k[:5]}...{k[-5:]}|{m}" for (k,m) in PERMANENTLY_BROKEN_MODELS]
     return jsonify({
         "metrics": metrics,
         "active_keys": len(API_KEYS),
         "daily_penalized_keys_minutes_left": penalized,
         "rpm_cooldowns_seconds_left": cooldowns,
+        "permanently_broken_key_model_pairs": broken,
         "models": get_active_models()
     })
 
