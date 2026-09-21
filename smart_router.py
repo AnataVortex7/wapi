@@ -472,8 +472,8 @@ def _list_combos_in_order(requested_model: str):
     """
     active_models = get_active_models()
 
-    GENERIC_ALIASES = {"gemini-pro", "auto", "default", "openrouter/auto", "round-robin",
-                        "gemini-working-model", ""}
+    GENERIC_ALIASES = {"gemini-pro", "auto", "default", "round-robin",
+                        "gemini-working-model", "openrouter/auto", ""}
     is_pool_mode = requested_model.lower() in GENERIC_ALIASES
 
     combos = []
@@ -796,6 +796,8 @@ fetchData();setInterval(fetchData,5000);
 
 # ─── Main Proxy ───────────────────────────────────────────────────────────────
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
+@app.route('/v1/chat/completions/', methods=['POST', 'OPTIONS'])
+@app.route('/v1/responses', methods=['POST', 'OPTIONS'])
 def proxy_chat():
     if request.method == 'OPTIONS':
         return Response(status=200)
