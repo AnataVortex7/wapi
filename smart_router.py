@@ -19,12 +19,18 @@ for m in RAW_MODELS:
     if not m.strip(): continue
     parts = m.split(":")
     name = parts[0].strip()
-    rpm  = int(parts[1].strip()) if len(parts) > 1 else 15
-    rpd  = int(parts[2].strip()) if len(parts) > 2 else (1500 if "flash" in name else 50)
+    rpm  = int(parts[1].strip()) if len(parts) > 1 and parts[1].strip() else 15
+    # RPD is optional (your format is just "name:rpm") -> safe default when absent
+    rpd  = int(parts[2].strip()) if len(parts) > 2 and parts[2].strip() else (1500 if "flash" in name else 50)
     MODELS.append({"name": name, "rpm": rpm, "rpd": rpd})
 
 if not MODELS:
     MODELS = [{"name": "gemini-2.0-flash-lite", "rpm": 30, "rpd": 1500}]
+
+# Concurrency safety margin: reserve this many RPM slots as a buffer so that
+# several requests admitted in the same instant (before their timestamps are
+# recorded) can never push the key+model pair over its real RPM limit.
+RPM_SAFETY_MARGIN = int(os.environ.get("RPM_SAFETY_MARGIN", "0"))
 
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
@@ -40,7 +46,11 @@ rpd_count: dict = {}
 # RPM cooldown (429 penalty): (key, model_name) -> monotonic timestamp until blocked
 rpm_cooldown: dict = {}
 
-# RPD daily penalty: key -> UTC timestamp when it unlocks (midnight IST)
+# RPD daily penalty: (key, model_name) -> UTC timestamp when it unlocks
+# (midnight IST). Scoped per model, NOT per key -- a key that hits its daily
+# quota on ONE model still works fine for every other model on that key.
+# Google's free-tier RPD quota is actually per (project/key, model) anyway,
+# so penalizing the whole key was both wrong and wasteful.
 key_daily_penalty: dict = {}
 
 # Last RPD reset date (IST)
@@ -75,7 +85,11 @@ def _prune_rpm(key, model_name):
 
 def _rpm_available(key, model_name, rpm_limit):
     window = _prune_rpm(key, model_name)
-    return len(window) < rpm_limit
+    # RPM_SAFETY_MARGIN reserves headroom so several requests admitted in the
+    # same instant (before their own timestamp is recorded) can never push
+    # the pair over the real limit when many users hit the router at once.
+    effective_limit = max(1, rpm_limit - RPM_SAFETY_MARGIN)
+    return len(window) < effective_limit
 
 def _rpd_available(key, model_name, rpd_limit):
     used = _get_key(key, model_name, rpd_count, lambda: 0)
@@ -87,8 +101,8 @@ def _is_rpm_cooldown(key, model_name):
     until = rpm_cooldown.get((key, model_name), 0)
     return time.monotonic() < until
 
-def _is_daily_penalized(key):
-    until = key_daily_penalty.get(key, 0)
+def _is_daily_penalized(key, model_name):
+    until = key_daily_penalty.get((key, model_name), 0)
     return time.time() < until
 
 def _record_request(key, model_name):
@@ -103,15 +117,17 @@ def _apply_rpm_cooldown(key, model_name, seconds=62):
     rpm_cooldown[(key, model_name)] = time.monotonic() + seconds
     print(f"[COOLDOWN] key=…{key[-6:]} model={model_name} blocked for {seconds}s")
 
-def _apply_daily_penalty(key):
-    """Block this key until midnight IST after daily RPD hit."""
+def _apply_daily_penalty(key, model_name):
+    """Block this (key, model) pair until midnight IST after its RPD limit
+    is hit. Only this model is blocked on this key -- every other model on
+    the same key keeps working normally."""
     now_ist = datetime.datetime.now(IST)
     next_midnight = (now_ist + datetime.timedelta(days=1)).replace(
         hour=0, minute=0, second=5, microsecond=0)
     unlock_ts = next_midnight.astimezone(datetime.timezone.utc).timestamp()
-    key_daily_penalty[key] = unlock_ts
+    key_daily_penalty[(key, model_name)] = unlock_ts
     mins = round((unlock_ts - time.time()) / 60)
-    print(f"[DAILY LIMIT] key=…{key[-6:]} penalized until midnight IST (~{mins} mins)")
+    print(f"[DAILY LIMIT] key=…{key[-6:]} model={model_name} penalized until midnight IST (~{mins} mins) — other models on this key are unaffected")
 
 # ─── Global Metrics ───────────────────────────────────────────────────────────
 metrics = {
@@ -165,87 +181,130 @@ def refresh_models_loop():
 threading.Thread(target=refresh_models_loop, daemon=True).start()
 
 def get_active_models():
-    with dynamic_models_lock:
-        return DYNAMIC_MODELS if DYNAMIC_MODELS else MODELS
+    # ALWAYS use the models you configured in GEMINI_MODELS for routing.
+    # The dynamically-fetched list (DYNAMIC_MODELS) is informational only —
+    # it used to silently replace your ENV pool in "auto" mode, which meant
+    # auto-mode requests could be routed to models you never approved/rate-
+    # limited in GEMINI_MODELS. That's fixed: MODELS (from env) is now the
+    # single source of truth for routing.
+    return MODELS
 
 # ─── Core: Smart Combo Picker ─────────────────────────────────────────────────
 current_key_idx   = 0
 current_model_idx = 0
 
-def get_best_combo(requested_model: str):
+def _list_combos_in_order(requested_model: str):
     """
+    Builds the ordered candidate list (key, model) for a request.
+    Must be called while already holding state_lock.
+
     Two modes:
-
-    1. POOL MODE (requested_model is empty / generic alias):
-       - Use ENV models as pool — try all key × model combos
-       - High-RPM models first, keys rotate per model
-       - This is the "all text models" path
-
+    1. POOL MODE ("auto"/empty/generic alias):
+       - Uses ONLY the models configured in GEMINI_MODELS (env) — never the
+         dynamically-fetched list — so auto mode always respects your RPM
+         settings for gemini-3.1-flash-lite, gemini-3.5-flash, etc.
+       - Tries all key × model combos, highest-RPM model first.
     2. SPECIFIC MODEL MODE (user sent a real model name):
-       - ONLY that model is used — no fallback to other models
-       - But ALL keys are tried (rotate keys on 429)
-       - If model is not in ENV pool, still use it with safe default limits
+       - Only that model is used, all keys are tried in rotation.
+    """
+    active_models = get_active_models()
 
-    Both modes filter out: daily-penalized keys, RPM cooldowns,
-    RPD exhausted pairs, and RPM-full pairs.
+    GENERIC_ALIASES = {"gemini-pro", "auto", "default", "round-robin",
+                        "gemini-working-model", ""}
+    is_pool_mode = requested_model.lower() in GENERIC_ALIASES
+
+    combos = []
+
+    if is_pool_mode:
+        sorted_models = sorted(active_models, key=lambda m: -m["rpm"])
+        K, M = len(API_KEYS), len(sorted_models)
+        if M == 0 or K == 0:
+            return []
+        start = (current_key_idx % K) * M + (current_model_idx % M)
+        for i in range(K * M):
+            idx = (start + i) % (K * M)
+            k_i = idx // M
+            m_i = idx % M
+            combos.append((k_i, m_i, API_KEYS[k_i], sorted_models[m_i]))
+    else:
+        model_dict = next(
+            (m for m in active_models if m["name"] == requested_model), None
+        )
+        if model_dict is None:
+            is_flash = "flash" in requested_model.lower()
+            model_dict = {
+                "name": requested_model,
+                "rpm": 15 if is_flash else 2,
+                "rpd": 1500 if is_flash else 50,
+            }
+        K = len(API_KEYS)
+        if K == 0:
+            return []
+        for i in range(K):
+            k_i = (current_key_idx + i) % K
+            combos.append((k_i, -1, API_KEYS[k_i], model_dict))
+
+    return combos
+
+
+def acquire_next_slot(requested_model: str, exclude: set):
+    """
+    Atomically picks the next viable (key, model) combo AND reserves it
+    (records the request timestamp) in one locked step.
+
+    This is the fix for the multi-user race condition: previously,
+    "find a viable combo" and "record that a request is using it" were two
+    separate lock acquisitions, so two requests arriving at nearly the same
+    moment could both pass the RPM check for the same key+model before
+    either one recorded its usage — letting concurrent users occasionally
+    slip past the RPM limit or collide on the same slot.
+
+    Now the check-then-reserve happens under a single lock hold, so at most
+    one caller can ever claim a given (key, model) slot for a given instant.
+    Returns (k_i, m_i, key, model) or None if nothing is viable right now.
     """
     with state_lock:
         _maybe_reset_rpd()
-        active_models = get_active_models()
-        env_model_names = {m["name"] for m in active_models}
 
         if not API_KEYS:
+            return None
+
+        combos = _list_combos_in_order(requested_model)
+
+        for (k_i, m_i, key, model) in combos:
+            if (key, model["name"]) in exclude:
+                continue
+            if _is_daily_penalized(key, model["name"]):
+                continue
+            if _is_rpm_cooldown(key, model["name"]):
+                continue
+            if not _rpd_available(key, model["name"], model["rpd"]):
+                continue
+            if not _rpm_available(key, model["name"], model["rpm"]):
+                continue
+
+            # Reserve immediately, still inside the lock, before returning —
+            # this is what closes the race window.
+            _record_request(key, model["name"])
+            return (k_i, m_i, key, model)
+
+        return None
+
+
+def get_best_combo(requested_model: str):
+    """
+    Kept for compatibility with /status and any external callers — returns
+    the full viable list WITHOUT reserving anything. The actual proxy path
+    uses acquire_next_slot() instead, which is race-free.
+    """
+    with state_lock:
+        _maybe_reset_rpd()
+        if not API_KEYS:
             return []
-
-        # Determine mode
-        GENERIC_ALIASES = {"gemini-pro","auto","default","round-robin",
-                           "gemini-working-model",""}
-        is_pool_mode = requested_model.lower() in GENERIC_ALIASES
-
-        combos = []
-
-        if is_pool_mode:
-            # ── POOL MODE: all key × model, sorted by highest RPM first ──
-            sorted_models = sorted(active_models, key=lambda m: -m["rpm"])
-            K, M = len(API_KEYS), len(sorted_models)
-            if M == 0:
-                return []
-            start = (current_key_idx % K) * M + (current_model_idx % M)
-            for i in range(K * M):
-                idx   = (start + i) % (K * M)
-                k_i   = idx // M
-                m_i   = idx % M
-                key   = API_KEYS[k_i]
-                model = sorted_models[m_i]
-                combos.append((k_i, m_i, key, model))
-
-        else:
-            # ── SPECIFIC MODEL MODE: only this model, rotate keys ──
-            # Look up limits from ENV pool; fall back to safe defaults
-            model_dict = next(
-                (m for m in active_models if m["name"] == requested_model), None
-            )
-            if model_dict is None:
-                # Model not in ENV — use it anyway with conservative defaults
-                # (gemma / pro models tend to have low limits)
-                is_flash = "flash" in requested_model.lower()
-                model_dict = {
-                    "name": requested_model,
-                    "rpm": 15 if is_flash else 2,
-                    "rpd": 1500 if is_flash else 50,
-                }
-
-            # Rotate keys starting from current position
-            K = len(API_KEYS)
-            for i in range(K):
-                k_i = (current_key_idx + i) % K
-                key = API_KEYS[k_i]
-                combos.append((k_i, -1, key, model_dict))
-
-        # ── Filter: only viable (non-penalized, non-full) combos ──
+        combos = _list_combos_in_order(requested_model)
         viable = []
         for (k_i, m_i, key, model) in combos:
-            if _is_daily_penalized(key):
+            if _is_daily_penalized(key, model["name"]):
                 continue
             if _is_rpm_cooldown(key, model["name"]):
                 continue
@@ -254,7 +313,6 @@ def get_best_combo(requested_model: str):
             if not _rpm_available(key, model["name"], model["rpm"]):
                 continue
             viable.append((k_i, m_i, key, model))
-
         return viable
 
 def set_sticky_success(k_idx, m_idx):
@@ -341,9 +399,12 @@ def api_dashboard_data():
     now_mono = time.monotonic()
     with state_lock:
         _maybe_reset_rpd()
+        # key_daily_penalty is now keyed by (key, model) — display it the
+        # same way rpm_cooldowns is displayed, so the dashboard shows which
+        # specific model on which key is daily-exhausted, not the whole key.
         penalized = {
-            k[:5]+"..."+k[-5:]: round((ts - now)/60, 1)
-            for k, ts in key_daily_penalty.items() if ts > now
+            f"{k[:5]}...{k[-5:]}|{m}": round((ts - now)/60, 1)
+            for (k, m), ts in key_daily_penalty.items() if ts > now
         }
         cooldowns = {
             f"{k[:5]}...{k[-5:]}|{m}": round(ts - now_mono, 1)
@@ -481,18 +542,23 @@ def proxy_chat():
     requested_model = data.get("model", "")
 
     last_resp = None
-    tried = set()
+    tried = set()  # (key, model_name) already attempted this request
 
-    # Keep trying until we exhaust all viable combos
-    max_outer_loops = 5  # safety cap
-    for outer in range(max_outer_loops):
-        combos = get_best_combo(requested_model)
-        # Remove already-tried ones
-        combos = [(ki, mi, k, m) for (ki, mi, k, m) in combos if (k, m["name"]) not in tried]
+    # How many total distinct (key, model) attempts to allow per incoming
+    # request before giving up. Sized to the whole pool so that under load
+    # we genuinely exhaust every key×model combo instead of stopping early.
+    max_attempts = max(20, len(API_KEYS) * max(1, len(MODELS)) + 5)
 
-        if not combos:
-            # No viable slot right now — wait for cooldowns to expire
-            # Check if any cooldown is expiring soon (within 65s)
+    for attempt in range(max_attempts):
+        # Atomic: pick a viable (key, model) AND reserve it in one lock hold.
+        # This closes the race window multiple simultaneous users could hit
+        # under the old "list combos, then record separately" approach.
+        slot = acquire_next_slot(requested_model, exclude=tried)
+
+        if slot is None:
+            # Nothing available right now for any untried combo.
+            # If something is about to come off cooldown soon, wait for it
+            # instead of failing the user's request.
             with state_lock:
                 now_mono = time.monotonic()
                 soonest = min(
@@ -501,87 +567,91 @@ def proxy_chat():
                 )
             if soonest and (soonest - now_mono) <= 65:
                 wait = soonest - time.monotonic() + 1.0
-                print(f"[WAIT] All slots busy, waiting {wait:.1f}s for cooldown...")
+                print(f"[WAIT] All slots busy, waiting {wait:.1f}s for a cooldown to clear...")
                 time.sleep(max(0, wait))
                 continue
-            break  # truly nothing available
+            break  # truly nothing available (e.g. all keys hit daily limit)
 
-        for (k_idx, m_idx, key, model) in combos:
-            actual_model = model["name"]
-            tried.add((key, actual_model))
-            data["model"] = actual_model
+        k_idx, m_idx, key, model = slot
+        actual_model = model["name"]
+        tried.add((key, actual_model))
+        data["model"] = actual_model
 
-            headers = {
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json"
-            }
-            url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json"
+        }
+        url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
-            with state_lock:
-                _record_request(key, actual_model)
+        try:
+            resp = requests.post(url, json=data, headers=headers, stream=True, timeout=120)
+            last_resp = resp
 
-            try:
-                resp = requests.post(url, json=data, headers=headers, stream=True, timeout=120)
-                last_resp = resp
+            if resp.status_code == 200:
+                set_sticky_success(k_idx, m_idx)
+                if hasattr(g, "log_entry"):
+                    g.log_entry["status"] = f"200 Success ({actual_model})"
+                with state_lock:
+                    metrics["successful_api_calls"] += 1
+                    safe_key = key[:5] + "..." + key[-5:]
+                    metrics["usage_by_key"].setdefault(safe_key, {})
+                    metrics["usage_by_key"][safe_key][actual_model] = \
+                        metrics["usage_by_key"][safe_key].get(actual_model, 0) + 1
 
-                if resp.status_code == 200:
-                    set_sticky_success(k_idx, m_idx)
-                    if hasattr(g, "log_entry"):
-                        g.log_entry["status"] = f"200 Success ({actual_model})"
-                    with state_lock:
-                        metrics["successful_api_calls"] += 1
-                        safe_key = key[:5] + "..." + key[-5:]
-                        metrics["usage_by_key"].setdefault(safe_key, {})
-                        metrics["usage_by_key"][safe_key][actual_model] = \
-                            metrics["usage_by_key"][safe_key].get(actual_model, 0) + 1
+                excluded = ['content-encoding','content-length','transfer-encoding','connection']
+                out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
+                return Response(resp.content, resp.status_code, out_headers)
 
-                    excluded = ['content-encoding','content-length','transfer-encoding','connection']
-                    out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
-                    return Response(resp.content, resp.status_code, out_headers)
+            elif resp.status_code in [429, 403]:
+                err_text = ""
+                try: err_text = resp.text.lower()
+                except: pass
 
-                elif resp.status_code in [429, 403]:
-                    err_text = ""
-                    try: err_text = resp.text.lower()
-                    except: pass
+                with state_lock:
+                    metrics["rate_limit_hits"] += 1
+                    if "per day" in err_text or "quota" in err_text or "daily" in err_text:
+                        # Daily RPD hit → penalize ONLY this (key, model) pair
+                        # until midnight IST. Every other model on this same
+                        # key keeps working — the key itself is not blocked,
+                        # only the specific model whose daily quota ran out.
+                        _apply_daily_penalty(key, actual_model)
+                        metrics["daily_limits_hit"] = metrics.get("daily_limits_hit", 0) + 1
+                    else:
+                        # RPM/rate hit → short cooldown for this key+model
+                        # pair only. Every other key and every other model
+                        # stays fully usable — this is what makes the
+                        # "instantly switch to a working model/key" behavior
+                        # work for other concurrent users too.
+                        _apply_rpm_cooldown(key, actual_model, seconds=62)
+                        metrics["rpm_cooldowns_applied"] = metrics.get("rpm_cooldowns_applied", 0) + 1
 
-                    with state_lock:
-                        metrics["rate_limit_hits"] += 1
-                        if "per day" in err_text or "quota" in err_text or "daily" in err_text:
-                            # Daily RPD hit → penalize key until midnight IST
-                            _apply_daily_penalty(key)
-                            metrics["daily_limits_hit"] = metrics.get("daily_limits_hit", 0) + 1
-                        else:
-                            # RPM hit → 62s cooldown for this key+model only
-                            _apply_rpm_cooldown(key, actual_model, seconds=62)
-                            metrics["rpm_cooldowns_applied"] = metrics.get("rpm_cooldowns_applied", 0) + 1
+                print(f"[429] key=…{key[-6:]} model={actual_model} → instantly switching to next key/model")
+                continue  # instantly retry with the next best slot
 
-                    print(f"[429] key=…{key[-6:]} model={actual_model} → trying next combo")
-                    continue  # try next combo in this loop
-
-                elif resp.status_code in [500, 503]:
-                    print(f"[{resp.status_code}] model={actual_model} server error, trying next...")
-                    continue
-
-                elif resp.status_code in [400, 404]:
-                    print(f"[{resp.status_code}] model={actual_model} invalid, removing from pool")
-                    with dynamic_models_lock:
-                        global DYNAMIC_MODELS, OPENAI_MODELS_LIST
-                        DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
-                        OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
-                    continue
-
-                else:
-                    with state_lock:
-                        metrics["failed_requests"] += 1
-                    excluded = ['content-encoding','content-length','transfer-encoding','connection']
-                    out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
-                    return Response(resp.content, resp.status_code, out_headers)
-
-            except Exception as e:
-                print(f"[ERROR] key=…{key[-6:]} model={actual_model}: {e}")
+            elif resp.status_code in [500, 503]:
+                print(f"[{resp.status_code}] model={actual_model} server error, trying next...")
                 continue
 
-    # All combos exhausted
+            elif resp.status_code in [400, 404]:
+                print(f"[{resp.status_code}] model={actual_model} invalid, removing from pool")
+                with dynamic_models_lock:
+                    global DYNAMIC_MODELS, OPENAI_MODELS_LIST
+                    DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
+                    OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
+                continue
+
+            else:
+                with state_lock:
+                    metrics["failed_requests"] += 1
+                excluded = ['content-encoding','content-length','transfer-encoding','connection']
+                out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
+                return Response(resp.content, resp.status_code, out_headers)
+
+        except Exception as e:
+            print(f"[ERROR] key=…{key[-6:]} model={actual_model}: {e}")
+            continue
+
+    # Every key×model combo was tried (or the pool is genuinely exhausted).
     with state_lock:
         metrics["failed_requests"] += 1
 
@@ -617,11 +687,12 @@ def proxy_transcriptions():
         "generationConfig": {"temperature": 0.0}
     }
 
+    TRANSCRIBE_MODEL = "gemini-1.5-flash"
     for key in API_KEYS:
-        if _is_daily_penalized(key):
+        if _is_daily_penalized(key, TRANSCRIBE_MODEL):
             continue
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{TRANSCRIBE_MODEL}:generateContent?key={key}"
             resp = requests.post(url, json=payload, timeout=60)
             if resp.status_code == 200:
                 with state_lock:
@@ -674,8 +745,8 @@ def get_status():
     now = time.time()
     now_mono = time.monotonic()
     with state_lock:
-        penalized = {k[:5]+"..."+k[-5:]: round((ts-now)/60,1)
-                     for k,ts in key_daily_penalty.items() if ts > now}
+        penalized = {f"{k[:5]}...{k[-5:]}|{m}": round((ts-now)/60,1)
+                     for (k,m),ts in key_daily_penalty.items() if ts > now}
         cooldowns = {f"{k[:5]}...{k[-5:]}|{m}": round(ts-now_mono,1)
                      for (k,m),ts in rpm_cooldown.items() if ts > now_mono}
     return jsonify({
