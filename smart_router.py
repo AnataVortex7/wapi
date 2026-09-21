@@ -813,6 +813,8 @@ def proxy_chat():
     data.pop('session_id', None)
     data.pop('user', None)
     requested_model = data.get("model", "")
+    if "/" in requested_model:
+        requested_model = requested_model.split("/")[-1]
     messages = data.get("messages", []) or []
     remote_addr = request.headers.get("X-Real-IP") or \
                   (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()) or \
