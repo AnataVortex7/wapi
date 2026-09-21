@@ -486,6 +486,45 @@ def handle_model_error(actual_model):
         DYNAMIC_MODELS = [m for m in DYNAMIC_MODELS if m['name'] != actual_model]
         OPENAI_MODELS_LIST = [m for m in OPENAI_MODELS_LIST if m['id'] != actual_model]
 
+THOUGHT_SIGNATURES = {}
+
+def intercept_signatures(content_bytes):
+    try:
+        text = content_bytes.decode('utf-8', errors='ignore')
+        for line in text.split('\n'):
+            line = line.strip()
+            if line.startswith('data: '):
+                data_str = line[6:].strip()
+                if data_str == '[DONE]' or not data_str:
+                    continue
+                try:
+                    data = json.loads(data_str)
+                    for choice in data.get('choices', []):
+                        delta = choice.get('delta', {})
+                        if 'tool_calls' in delta:
+                            for tc in delta['tool_calls']:
+                                tc_id = tc.get('id')
+                                sig = tc.get('thought_signature')
+                                if tc_id and sig:
+                                    THOUGHT_SIGNATURES[tc_id] = sig
+                except:
+                    pass
+            elif line.startswith('{'):
+                try:
+                    data = json.loads(line)
+                    for choice in data.get('choices', []):
+                        message = choice.get('message', {})
+                        if 'tool_calls' in message:
+                            for tc in message['tool_calls']:
+                                tc_id = tc.get('id')
+                                sig = tc.get('thought_signature')
+                                if tc_id and sig:
+                                    THOUGHT_SIGNATURES[tc_id] = sig
+                except:
+                    pass
+    except:
+        pass
+
 @app.route('/v1/chat/completions', methods=['POST', 'OPTIONS'])
 def proxy_chat():
     if request.method == 'OPTIONS':
@@ -497,6 +536,18 @@ def proxy_chat():
     data = request.json or {}
     data.pop('session_id', None)
     data.pop('user', None)
+
+    # INJECT THOUGHT SIGNATURE for Gemini compatibility
+    if "messages" in data:
+        for msg in data["messages"]:
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                for tc in msg["tool_calls"]:
+                    if tc.get("type") == "function":
+                        tc_id = tc.get("id")
+                        if tc_id in THOUGHT_SIGNATURES:
+                            tc["thought_signature"] = THOUGHT_SIGNATURES[tc_id]
+                        elif "thought_signature" not in tc:
+                            tc["thought_signature"] = ""
 
     requested_model = data.get("model", "")
     
@@ -513,6 +564,7 @@ def proxy_chat():
     
     if resp is not None:
         if resp.status_code == 200:
+            intercept_signatures(resp.content)
             if hasattr(g, "log_entry"): g.log_entry["status"] = f"200 Success ({actual_model})"
             with state_lock:
                 metrics["successful_api_calls"] += 1
