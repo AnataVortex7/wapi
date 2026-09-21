@@ -4,13 +4,13 @@ from collections import deque
 from flask import Flask, request, jsonify, Response, render_template_string, g
 from functools import wraps
 import requests
-import base64
+import base64, copy, hashlib, re
 
 app = Flask(__name__)
 
 # ─── Config from Environment ──────────────────────────────────────────────────
 RAW_KEYS   = os.environ.get("GEMINI_API_KEYS", "").split(",")
-RAW_MODELS = os.environ.get("GEMINI_MODELS", "gemini-2.0-flash-lite:30:1500,gemini-2.0-flash:15:1500,gemini-2.5-flash-lite:15:1000,gemini-2.5-flash:10:250,gemini-1.5-flash-latest:15:1500,gemma-4-26b-a4b-it:15:50,gemma-4-31b-it:15:50,gemini-1.5-pro-latest:2:50").split(",")
+RAW_MODELS = os.environ.get("GEMINI_MODELS", "gemini-3.1-flash-lite:15:500,gemini-3.5-flash-lite:15:500,gemini-3.5-flash:5:20,gemini-3.6-flash:5:20,gemini-3.7-flash:5:20,gemini-3.8-flash:5:20").split(",")
 
 API_KEYS = list(dict.fromkeys([k.strip() for k in RAW_KEYS if k.strip()]))
 
@@ -80,7 +80,7 @@ PERMANENTLY_BROKEN_MODELS: set = set()
 # is unaffected -- only steps *within* one tool-calling task stay glued to
 # the same model.
 CONV_STICKY_TTL = 3 * 60 * 60   # forget a caller's pin after 3h of no traffic
-STICKY_MAX_WAIT = 90.0          # max seconds to hold a request waiting on RPM
+STICKY_MAX_WAIT = float(os.environ.get("STICKY_MAX_WAIT", "5"))  # short wait for RPM on the pinned model; after that we switch (signatures are re-injected)
 conversation_sticky: dict = {}   # client_id -> (key, model_name, last_used_monotonic)
 
 def _client_id_from_request(data: dict, remote_addr: str) -> str:
@@ -170,7 +170,118 @@ def acquire_sticky_slot_wait(client_id: str):
 
 def remember_sticky_slot(client_id: str, key: str, model_name: str):
     with state_lock:
+        rate_strikes.pop((key, model_name), None)
         conversation_sticky[client_id] = (key, model_name, time.monotonic())
+
+
+# ─── thought_signature cache + injection (enables key/model switching) ───────
+# Clients like Hermes drop `extra_content.google.thought_signature` from the
+# assistant tool_calls they echo back. We capture it from every Google
+# response, cache it by tool_call id, and put it back into the history
+# before forwarding -- so the next step may run on ANY key/model.
+SIG_CACHE_TTL = int(os.environ.get("SIG_CACHE_TTL", str(6 * 3600)))
+# Dummy signature Google documents for history that has none (Gemini 3 only).
+# Set env SIG_FALLBACK="" to disable.
+SIG_FALLBACK = os.environ.get("SIG_FALLBACK", "skip_thought_signature_validator")
+sig_cache: dict = {}            # key -> (signature, monotonic_ts)
+sig_lock = threading.Lock()
+
+def _tc_fp(tc: dict):
+    fn = tc.get("function") or {}
+    name, args = fn.get("name") or "", fn.get("arguments") or ""
+    try: args = json.dumps(json.loads(args), sort_keys=True)
+    except Exception: pass
+    return "fp:" + hashlib.sha1(f"{name}|{args}".encode()).hexdigest()
+
+def _extract_sig(tc: dict):
+    return (((tc.get("extra_content") or {}).get("google") or {}).get("thought_signature"))
+
+def _store_sig(tc: dict):
+    sig = _extract_sig(tc)
+    if not sig: return
+    now = time.monotonic()
+    with sig_lock:
+        if len(sig_cache) > 5000:
+            cutoff = now - SIG_CACHE_TTL
+            for k in [k for k, (_, ts) in sig_cache.items() if ts < cutoff]:
+                sig_cache.pop(k, None)
+        if tc.get("id"): sig_cache[tc["id"]] = (sig, now)
+        fn = tc.get("function") or {}
+        if fn.get("name") and fn.get("arguments") is not None:
+            sig_cache[_tc_fp(tc)] = (sig, now)
+
+def _lookup_sig(tc: dict):
+    with sig_lock:
+        for k in (tc.get("id"), _tc_fp(tc)):
+            if k and k in sig_cache and sig_cache[k][1] > time.monotonic() - SIG_CACHE_TTL:
+                return sig_cache[k][0]
+    return None
+
+def capture_signatures(body: bytes):
+    """Read a Google response (plain JSON or SSE) and cache tool-call signatures."""
+    try:
+        text = body.decode("utf-8", "replace")
+        if text.lstrip().startswith("data:") or "\ndata:" in text:
+            for line in text.splitlines():
+                line = line.strip()
+                if not line.startswith("data:") or line.endswith("[DONE]"): continue
+                try: obj = json.loads(line[5:].strip())
+                except Exception: continue
+                for ch in obj.get("choices", []):
+                    for tc in ((ch.get("delta") or {}).get("tool_calls") or []):
+                        _store_sig(tc)
+        else:
+            obj = json.loads(text)
+            for ch in obj.get("choices", []):
+                for tc in ((ch.get("message") or {}).get("tool_calls") or []):
+                    _store_sig(tc)
+    except Exception as e:
+        print(f"[SIG CAPTURE] {e}")
+
+def prepare_payload(data: dict, model_name: str, force_dummy: bool = False) -> dict:
+    """Copy of the request with signatures fixed up for the chosen model.
+    - gemini-*  : restore the cached real signature; dummy if none cached
+                  (dummy is only used for gemini-3*, where it is required).
+    - others    : (gemma) REAL signatures are rejected (400) and none gives a
+                  500, but the dummy is accepted -> always send the dummy.
+    - force_dummy: used by the self-heal retry after a signature 400."""
+    payload = dict(data)
+    msgs = copy.deepcopy(data.get("messages") or [])
+    is_gemini = model_name.startswith("gemini-")
+    is_g3 = model_name.startswith("gemini-3")
+
+    def put_dummy(tcs):
+        for tc in tcs: tc.pop("extra_content", None)
+        if SIG_FALLBACK:
+            tcs[0]["extra_content"] = {"google": {"thought_signature": SIG_FALLBACK}}
+
+    for m in msgs:
+        tcs = m.get("tool_calls") if m.get("role") == "assistant" else None
+        if not tcs: continue
+        if force_dummy or not is_gemini:
+            put_dummy(tcs)
+            continue
+        for tc in tcs:
+            if not _extract_sig(tc):
+                sig = _lookup_sig(tc)
+                if sig:
+                    tc.setdefault("extra_content", {}).setdefault("google", {})["thought_signature"] = sig
+        if is_g3 and SIG_FALLBACK and not any(_extract_sig(tc) for tc in tcs):
+            tcs[0].setdefault("extra_content", {}).setdefault("google", {})["thought_signature"] = SIG_FALLBACK
+    payload["messages"] = msgs
+    return payload
+
+def _heal_signature(resp, url, headers, data, model_name):
+    """If Google says the signature is missing/invalid, retry ONCE on the same
+    key+model with the dummy signature instead of failing the user."""
+    try:
+        if resp.status_code == 400 and "thought_signature" in resp.text.lower():
+            print(f"[SIG HEAL] {model_name}: signature 400 -> retrying with dummy signature")
+            return requests.post(url, json=prepare_payload(data, model_name, force_dummy=True),
+                                 headers=headers, stream=True, timeout=120)
+    except Exception as e:
+        print(f"[SIG HEAL ERROR] {e}")
+    return resp
 
 # Last RPD reset date (IST)
 _last_rpd_reset = datetime.datetime.now(IST).strftime("%Y-%m-%d")
@@ -258,6 +369,39 @@ metrics = {
     "failed_requests": 0,
     "usage_by_key": {}
 }
+
+
+# ─── Smarter 429 classification ──────────────────────────────────────────────
+# Google's "You exceeded your current quota" text is used for BOTH per-minute
+# and per-day limits. The old code treated every message containing "quota" as
+# a DAILY limit and locked the model until midnight even after a 1-minute hit.
+# We now read the quotaId (…PerDay… / …PerMinute…) and the retryDelay.
+rate_strikes: dict = {}   # (key, model) -> consecutive ambiguous 429 count
+
+def _handle_429(key, model_name, err_text: str) -> str:
+    """Classify a 429 and apply the right penalty. Call with state_lock held.
+    Returns "daily" or "rpm"."""
+    t = (err_text or "").lower()
+    k = (key, model_name)
+    if "perday" in t or "per day" in t or "daily" in t or "per_day" in t:
+        _apply_daily_penalty(key, model_name)
+        return "daily"
+    m = re.search(r'retrydelay"?\s*[:=]\s*"?(\d+(?:\.\d+)?)s', t)
+    retry = float(m.group(1)) + 2 if m else None
+    if "perminute" in t or "per minute" in t or "per_minute" in t:
+        rate_strikes.pop(k, None)
+        _apply_rpm_cooldown(key, model_name, seconds=int(retry or 62))
+        return "rpm"
+    # Ambiguous ("quota" with no PerDay/PerMinute, e.g. limit 0 on free tier,
+    # or a bare 429): escalate 62s -> 5min -> 30min -> daily, reset on success.
+    n = rate_strikes.get(k, 0) + 1
+    rate_strikes[k] = n
+    if n >= 4:
+        _apply_daily_penalty(key, model_name)
+        return "daily"
+    secs = int(retry) if retry else {1: 62, 2: 300, 3: 1800}[n]
+    _apply_rpm_cooldown(key, model_name, seconds=max(secs, 30))
+    return "rpm"
 
 # ─── Dynamic model list (refreshed daily from API) ────────────────────────────
 dynamic_models_lock = threading.Lock()
@@ -681,65 +825,38 @@ def proxy_chat():
     tried = set()  # (key, model_name) already attempted this request
 
     if is_continuation:
-        # MUST stay on the (key, model) that started this tool-calling
-        # turn, or Gemini's thought_signature check fails. Wait through
-        # short RPM limits instead of switching; only give up (and clear
-        # the pin) once the daily quota is genuinely gone.
+        # PREFER the (key, model) that produced the tool call (its signature
+        # is guaranteed valid), but never fail because of it: if it is
+        # rate-limited / exhausted / erroring we fall through to normal
+        # routing, and prepare_payload() re-injects the cached signature.
         outcome, key, model = acquire_sticky_slot_wait(client_id)
-
-        if outcome == "exhausted":
-            return jsonify({
-                "error": {
-                    "message": "Daily quota exhausted for the model handling this "
-                                "task. This step could not be completed on the same "
-                                "model, so the thought/tool signature can't carry "
-                                "over. Please send a new message to start fresh "
-                                "(it will pick up a working model automatically).",
-                    "type": "quota_exceeded"
-                }
-            }), 429
-
-        if outcome == "busy":
-            return jsonify({
-                "error": {
-                    "message": "The model handling this task is briefly rate-limited. "
-                                "Please retry in a few seconds -- it will resume on "
-                                "the same model.",
-                    "type": "rate_limit_error"
-                }
-            }), 429
-
         if outcome == "ok":
-            print(f"[STICKY] {client_id} → staying on key=…{key[-6:]} model={model['name']}")
-            tried.add((key, model["name"]))
             actual_model = model["name"]
+            print(f"[STICKY] {client_id} → preferring key=…{key[-6:]} model={actual_model}")
+            tried.add((key, actual_model))
             data["model"] = actual_model
             headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
             url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
             try:
-                resp = requests.post(url, json=data, headers=headers, stream=True, timeout=120)
+                resp = requests.post(url, json=prepare_payload(data, actual_model), headers=headers, stream=True, timeout=120)
+                resp = _heal_signature(resp, url, headers, data, actual_model)
                 if resp.status_code == 200:
                     remember_sticky_slot(client_id, key, actual_model)
+                    capture_signatures(resp.content)
                     with state_lock:
                         metrics["successful_api_calls"] += 1
                     excluded = ['content-encoding','content-length','transfer-encoding','connection']
                     out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
                     return Response(resp.content, resp.status_code, out_headers)
-                # A non-200 on the pinned slot despite our own RPM/RPD checks
-                # passing (e.g. Google's own limit differs slightly from
-                # ours, or a genuine signature/payload issue) -- surface it
-                # directly rather than silently trying a different model,
-                # since a different model can't validate this signature
-                # anyway.
-                excluded = ['content-encoding','content-length','transfer-encoding','connection']
-                out_headers = [(n, v) for n, v in resp.raw.headers.items() if n.lower() not in excluded]
-                return Response(resp.content, resp.status_code, out_headers)
+                if resp.status_code in (429, 403):
+                    err = resp.text.lower()
+                    with state_lock:
+                        _handle_429(key, actual_model, err)
+                print(f"[STICKY] pinned slot returned {resp.status_code} → switching slot")
+                last_resp = resp
             except Exception as e:
-                return jsonify({"error": {"message": f"Upstream error on pinned model: {e}", "type": "upstream_error"}}), 502
-        # outcome is None -> no pin exists yet for this client (e.g. process
-        # just restarted mid-task). Nothing safe to resume -- fall through
-        # to normal routing below; this one step may still 400, but the
-        # NEXT message from the user will get a clean new pin.
+                print(f"[STICKY ERROR] {e} → switching slot")
+        # exhausted / busy / no pin / pinned failed -> normal routing below
 
     # How many total distinct (key, model) attempts to allow per incoming
     # request before giving up. Sized to the whole pool so that under load
@@ -784,7 +901,8 @@ def proxy_chat():
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
         try:
-            resp = requests.post(url, json=data, headers=headers, stream=True, timeout=120)
+            resp = requests.post(url, json=prepare_payload(data, actual_model), headers=headers, stream=True, timeout=120)
+            resp = _heal_signature(resp, url, headers, data, actual_model)
             last_resp = resp
 
             if resp.status_code == 200:
@@ -795,6 +913,7 @@ def proxy_chat():
                 # request (the tool result) lands back on the same slot and
                 # its thought_signature still validates.
                 remember_sticky_slot(client_id, key, actual_model)
+                capture_signatures(resp.content)
                 if hasattr(g, "log_entry"):
                     g.log_entry["status"] = f"200 Success ({actual_model})"
                 with state_lock:
@@ -815,20 +934,10 @@ def proxy_chat():
 
                 with state_lock:
                     metrics["rate_limit_hits"] += 1
-                    if "per day" in err_text or "quota" in err_text or "daily" in err_text:
-                        # Daily RPD hit → penalize ONLY this (key, model) pair
-                        # until midnight IST. Every other model on this same
-                        # key keeps working — the key itself is not blocked,
-                        # only the specific model whose daily quota ran out.
-                        _apply_daily_penalty(key, actual_model)
+                    kind = _handle_429(key, actual_model, err_text)
+                    if kind == "daily":
                         metrics["daily_limits_hit"] = metrics.get("daily_limits_hit", 0) + 1
                     else:
-                        # RPM/rate hit → short cooldown for this key+model
-                        # pair only. Every other key and every other model
-                        # stays fully usable — this is what makes the
-                        # "instantly switch to a working model/key" behavior
-                        # work for other concurrent users too.
-                        _apply_rpm_cooldown(key, actual_model, seconds=62)
                         metrics["rpm_cooldowns_applied"] = metrics.get("rpm_cooldowns_applied", 0) + 1
 
                 print(f"[429] key=…{key[-6:]} model={actual_model} → instantly switching to next key/model")
@@ -861,11 +970,20 @@ def proxy_chat():
                 #    hard-disable the model on the known compatibility
                 #    signatures below and otherwise just move on and let the
                 #    request fail after trying a couple of other slots.
+                if resp.status_code == 404 and ("no longer available" in err_text
+                                                or "is not found" in err_text
+                                                or "not found for api version" in err_text):
+                    with state_lock:
+                        for _k in API_KEYS:
+                            PERMANENTLY_BROKEN_MODELS.add((_k, actual_model))
+                    print(f"[404 RETIRED] {actual_model} no longer exists -> removed from pool for all keys "
+                          f"(remove it from GEMINI_MODELS env)")
+                    continue
+
                 model_is_incompatible = any(sig in err_text for sig in [
-                    "interactions api",
-                    "thought_signature",
-                    "not supported",
-                    "unsupported",
+                    "interactions api",   # genuinely model-level. NOT thought_signature /
+                                          # unsupported: those are per-request problems and
+                                          # used to permanently ban healthy models.
                 ])
 
                 if model_is_incompatible:
