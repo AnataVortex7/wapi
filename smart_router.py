@@ -260,10 +260,46 @@ CHAT_COMPLETIONS_ALLOWED_KEYS = {
     "_conv_hint",  # internal marker, stripped later in proxy_chat before forwarding
 }
 
+def _normalize_tools(tools):
+    """Responses API sends function tools FLAT: {"type":"function","name":...,
+    "description":...,"parameters":...,"strict":...} directly on the tool
+    object. Chat Completions (what Gemini's compat layer expects) nests it:
+    {"type":"function","function":{"name":...,"description":...,"parameters":...}}.
+    Sending the flat shape is exactly what produced "Unknown name \"name\" at
+    'tools[0]'" etc -- Gemini was looking for a "function" key that wasn't
+    there. "strict" isn't forwarded at all; Gemini doesn't support it."""
+    if not isinstance(tools, list):
+        return tools
+    fixed = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") == "function" and "function" not in t and "name" in t:
+            fn = {"name": t.get("name"), "description": t.get("description", "")}
+            if "parameters" in t:
+                fn["parameters"] = t["parameters"]
+            fixed.append({"type": "function", "function": fn})
+        else:
+            fixed.append(t)
+    return fixed
+
+def _normalize_tool_choice(tc):
+    """Same flat-vs-nested mismatch as tools, for tool_choice: Responses API
+    sends {"type":"function","name":"foo"}; Chat Completions wants
+    {"type":"function","function":{"name":"foo"}}."""
+    if isinstance(tc, dict) and tc.get("type") == "function" and "function" not in tc and "name" in tc:
+        return {"type": "function", "function": {"name": tc["name"]}}
+    return tc
+
 def normalize_to_chat_completions(data: dict) -> dict:
     """Accepts either a normal Chat Completions body OR a Responses-API body
     and returns something Gemini's /v1beta/openai/chat/completions accepts."""
     data = dict(data)
+
+    if "tools" in data:
+        data["tools"] = _normalize_tools(data["tools"])
+    if "tool_choice" in data:
+        data["tool_choice"] = _normalize_tool_choice(data["tool_choice"])
 
     if "messages" not in data and "input" in data:
         raw_input = data.pop("input")
