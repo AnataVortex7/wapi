@@ -81,7 +81,7 @@ def refresh_models_loop():
                             name = m["name"].replace("models/", "")
                             methods = m.get("supportedGenerationMethods", [])
                             # Only include models that generate text/content, and exclude specific modalities/experimental tool-breaking models
-                            if "generateContent" in methods and not any(x in name.lower() for x in ["embedding", "tts", "image", "transcribe", "robotics", "aqa", "thinking"]):
+                            if "generateContent" in methods and name.startswith("gemini-") and not any(x in name.lower() for x in ["embedding", "tts", "image", "transcribe", "robotics", "aqa", "thinking", "working", "learnlm"]):
                                 new_openai.append({"id": name, "object": "model", "created": now, "owned_by": "google"})
                                 rpm, rpd = default_rpm_rpd(name)
                                 new_rr.append({"name": name, "rpm": rpm, "rpd": rpd})
@@ -563,7 +563,7 @@ def proxy_chat():
         url = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
         return requests.post(url, json=data, headers=headers, stream=True)
 
-    resp, key, actual_model = make_request_with_smart_retry(mgr, call_fn, requested_model, on_model_error=handle_model_error)
+    resp, key, actual_model = make_request_with_smart_retry(mgr, call_fn, requested_model, max_retries=15, on_model_error=handle_model_error)
     
     if resp is not None:
         if resp.status_code == 200:
