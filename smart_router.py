@@ -595,7 +595,7 @@ def refresh_models_loop():
                                 rpm = 30 if "flash-lite" in name else (15 if "flash" in name else 2)
                                 rpd = 1500 if "flash-lite" in name else (1500 if "flash" in name else 50)
                                 new_rr.append({"name": name, "rpm": rpm, "rpd": rpd})
-                        for extra in ["dall-e-3", "whisper-1", "tts-1"]:
+                        for extra in ["dall-e-3", "whisper-1", "auto", "tts-1"]:
                             if not any(x["id"] == extra for x in new_openai):
                                 new_openai.append({"id": extra, "object": "model", "created": now, "owned_by": "google"})
                         with dynamic_models_lock:
